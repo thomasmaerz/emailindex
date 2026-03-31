@@ -159,8 +159,8 @@ class GetConversationParams(BaseModel):
     @classmethod
     def validate_thread_id(cls, v: str) -> str:
         import re
-        if not re.match(r'^thread-[a-f0-9]{16}$', v):
-            raise ValueError('thread_id must match pattern: thread-<16 hex chars>')
+        if not re.match(r'^thread-.*$', v):
+            raise ValueError('thread_id must match pattern: thread-<hash or subject key>')
         return v
 
 
