@@ -57,65 +57,43 @@ def search_emails(
     where_clauses = []
     params = []
     
-    # Vector similarity search
+    # Vector similarity search using sqlite-vec
     if similar_to_email_id:
         cursor.execute("SELECT embedding FROM emails WHERE id = ?", (similar_to_email_id,))
         row = cursor.fetchone()
         if row and row['embedding']:
-            import numpy as np
-            
-            target_embedding = np.frombuffer(row['embedding'], dtype=np.float32)
-            
-            cursor.execute("SELECT id, embedding FROM emails WHERE id != ? AND embedding IS NOT NULL", (similar_to_email_id,))
-            candidates = cursor.fetchall()
-            
-            if candidates:
-                results_with_scores = []
-                for candidate in candidates:
-                    cand_emb = np.frombuffer(candidate['embedding'], dtype=np.float32)
-                    
-                    norm_target = np.linalg.norm(target_embedding)
-                    norm_cand = np.linalg.norm(cand_emb)
-                    if norm_target > 0 and norm_cand > 0:
-                        similarity = np.dot(target_embedding, cand_emb) / (norm_target * norm_cand)
-                    else:
-                        similarity = 0.0
-                    
-                    results_with_scores.append((candidate['id'], similarity))
+            try:
+                cursor.execute("""
+                    SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address,
+                           e.from_name, e.has_attachments, e.folder, e.body_markdown as snippet,
+                           vec_distance_cosine(e.embedding, ?) as score
+                    FROM emails e
+                    WHERE e.id != ? AND e.embedding IS NOT NULL
+                    ORDER BY score DESC
+                    LIMIT ?
+                """, (row['embedding'], similar_to_email_id, limit))
                 
-                results_with_scores.sort(key=lambda x: x[1], reverse=True)
-                top_ids = [r[0] for r in results_with_scores[:limit]]
+                results = cursor.fetchall()
+                close_connection()
                 
-                if top_ids:
-                    placeholders = ','.join(['?' for _ in top_ids])
-                    sql = f"""
-                        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address, 
-                               e.from_name, e.has_attachments, e.folder, e.body_markdown as snippet
-                        FROM emails e
-                        WHERE e.id IN ({placeholders})
-                    """
-                    cursor.execute(sql, top_ids)
-                    results = cursor.fetchall()
-                    
-                    id_to_score = {r[0]: r[1] for r in results_with_scores}
-                    
-                    close_connection()
-                    
-                    return [
-                        EmailSearchResult(
-                            id=r['id'],
-                            thread_id=r['thread_id'],
-                            subject=r['subject'],
-                            timestamp=r['timestamp'],
-                            from_address=r['from_address'],
-                            from_name=r['from_name'],
-                            snippet=r['snippet'][:500] if r['snippet'] else "",
-                            score=id_to_score.get(r['id']),
-                            has_attachments=bool(r['has_attachments']),
-                            folder=r['folder']
-                        )
-                        for r in results
-                    ]
+                return [
+                    EmailSearchResult(
+                        id=r['id'],
+                        thread_id=r['thread_id'],
+                        subject=r['subject'],
+                        timestamp=r['timestamp'],
+                        from_address=r['from_address'],
+                        from_name=r['from_name'],
+                        snippet=r['snippet'][:500] if r['snippet'] else "",
+                        score=r['score'],
+                        has_attachments=bool(r['has_attachments']),
+                        folder=r['folder']
+                    )
+                    for r in results
+                ]
+            except Exception as e:
+                close_connection()
+                raise ValueError(f"Vector search failed: {e}")
     
     # Full-text search (with optional hybrid vector scoring)
     fts_only = False

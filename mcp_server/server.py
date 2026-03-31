@@ -100,9 +100,31 @@ class MCPServer:
     def handle_request(self, request: dict) -> dict:
         method = request.get("method")
         params = request.get("params", {})
+        request_id = request.get("id")
+        
+        if method == "initialize":
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "email-intelligence",
+                        "version": "1.0.0"
+                    }
+                }
+            }
+        
+        if method == "initialized":
+            return {"jsonrpc": "2.0", "id": request_id, "result": None}
         
         if method == "tools/list":
             return {
+                "jsonrpc": "2.0",
+                "id": request_id,
                 "result": {
                     "tools": [
                         {
@@ -166,15 +188,15 @@ class MCPServer:
             tool_params = params.get("arguments", {})
             
             if tool_name not in self.tools:
-                return {"error": f"Unknown tool: {tool_name}"}
+                return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}}
             
             try:
                 result = self.tools[tool_name](tool_params)
-                return {"result": result}
+                return {"jsonrpc": "2.0", "id": request_id, "result": result}
             except Exception as e:
-                return {"error": str(e)}
+                return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": str(e)}}
         
-        return {"error": f"Unknown method: {method}"}
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}}
 
 
 def main():

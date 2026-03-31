@@ -7,7 +7,7 @@
 ## Features
 
 - **Hybrid Search**: Seamlessly combines SQLite FTS5 (BM25) with semantic vector similarity.
-- **Cosine Similarity Ranking**: Vector searches now return precise similarity scores calculated using `numpy` for better relevance ranking.
+- **Cosine Similarity Ranking**: Vector searches return precise similarity scores using `sqlite-vec`'s `vec_distance_cosine()` for high-performance relevance ranking.
 - **Intelligent Threading**: Reconstructs conversation threads using RFC 822 References/In-Reply-To chains with a robust **subject-based fallback** for emails missing standard headers.
 - **Deduplicated Attachments**: SHA-256 based deduplication ensures that multiple copies of the same file across different emails only occupy space once.
 - **Resumable Ingestion**: A robust batch-based ingestion pipeline with checkpointing and error recovery.
@@ -63,24 +63,50 @@ This will:
 
 ### 3. MCP Server
 
-Start the MCP server in stdio mode:
+The MCP server uses a wrapper script that handles the JSON-RPC 2.0 protocol required by modern MCP clients (OpenCode, Claude Desktop):
 
 ```bash
-python3 -m mcp_server.server --stdio
+python3 run-mcp-server.py --stdio
 ```
+
+Or equivalently:
+
+```bash
+./run-mcp-server.sh
+```
+
+> **Note:** The wrapper script (`run-mcp-server.py`) is required because it handles the MCP protocol handshake (`initialize`, `initialized`) and formats all responses as proper JSON-RPC 2.0.
 
 ---
 
 ## OpenCode / Claude Desktop Integration
 
-Add the following to your `opencode.json` or `claude_desktop_config.json`:
+Add the following to your OpenCode configuration (`~/.config/opencode/opencode.json`):
+
+```json
+{
+  "mcp": {
+    "emailindex": {
+      "type": "local",
+      "command": [
+        "/path/to/miniconda3/envs/emailindex/bin/python3",
+        "/path/to/emailindex/run-mcp-server.py"
+      ],
+      "enabled": true
+    }
+  }
+}
+```
+
+> **Important:** Use the wrapper script path (`run-mcp-server.py`), not the module path (`-m mcp_server.server`). The wrapper handles the required JSON-RPC 2.0 protocol handshake.
+
+For Claude Desktop, use:
 
 ```json
 {
   "mcpServers": {
     "emailindex": {
-      "type": "local",
-      "command": ["/path/to/miniconda3/envs/emailindex/bin/python3", "-m", "mcp_server.server", "--stdio"],
+      "command": ["/path/to/miniconda3/envs/emailindex/bin/python3", "/path/to/emailindex/run-mcp-server.py"],
       "env": {
         "PYTHONPATH": "/path/to/emailindex"
       }
@@ -102,10 +128,102 @@ Add the following to your `opencode.json` or `claude_desktop_config.json`:
 
 ## Architecture
 
+- **`run-mcp-server.py`**: Wrapper script that handles JSON-RPC 2.0 protocol (initialize handshake, response formatting). This is the entry point for MCP clients.
+- **`run-mcp-server.sh`**: Shell script alternative for starting the MCP server.
 - **`ingest.py`**: The ingestion pipeline, handling parsing, deduplication, and storage.
-- **`mcp_server/database.py`**: The persistence layer, managing **thread-local SQLite connections** and complex search queries.
-- **`mcp_server/server.py`**: The MCP transport layer, exposing tools via JSON-RPC.
+- **`mcp_server/server.py`**: Core MCP server logic - tool definitions and request handling.
+- **`mcp_server/database.py`**: The persistence layer, managing **thread-local SQLite connections** and complex search queries (FTS5 + vector similarity).
 - **`mcp_server/models.py`**: Pydantic models ensuring strict data integrity (UUID, Email, and ThreadID validation).
+- **`mcp_server/config.py`**: Configuration constants (paths, model settings, timeouts).
+
+---
+
+## Troubleshooting
+
+### MCP Connection Timeout
+
+**Symptom:** OpenCode shows "Operation timed out after 30000ms" for emailindex.
+
+**Causes & Solutions:**
+
+1. **Missing JSON-RPC 2.0 wrapper**
+   - Ensure you're using `run-mcp-server.py`, not `-m mcp_server.server`
+   - The wrapper handles the required `initialize` handshake
+
+2. **Wrong response format**
+   - Responses must include `jsonrpc`, `id`, and `result` fields
+   - Check server logs at `/tmp/mcp_start.log` for debugging
+
+3. **Test the handshake manually:**
+   ```bash
+   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}' | python3 run-mcp-server.py
+   ```
+   Should return: `{"jsonrpc": "2.0", "id": 1, "result": {...}}`
+
+### sqlite-vec Installation Issues
+
+**Symptom:** `ModuleNotFoundError: No module named 'sqlite_vec'`
+
+**Solutions:**
+
+1. **Using conda (recommended):**
+   ```bash
+   conda install -c conda-forge sqlite-vec
+   ```
+
+2. **Using pip:**
+   ```bash
+   pip install sqlite-vec
+   ```
+
+3. **Verify installation:**
+   ```bash
+   python3 -c "import sqlite_vec; print('sqlite-vec loaded')"
+   ```
+
+### Import Errors
+
+**Symptom:** `ModuleNotFoundError: No module named 'mcp_server'`
+
+**Solution:** The wrapper script sets `PYTHONPATH` automatically. If running manually:
+```bash
+export PYTHONPATH=/path/to/emailindex
+python3 -m mcp_server.server --stdio
+```
+
+### Vector Search is Slow
+
+**Symptom:** Similar email search takes >10 seconds.
+
+**Cause:** Using Python-based vector computation instead of sqlite-vec.
+
+**Solution:** Ensure sqlite-vec is loaded and using `vec_distance_cosine()`:
+```python
+# Fast - uses SQLite/C
+cursor.execute("""
+    SELECT id, vec_distance_cosine(embedding, ?) as score
+    FROM emails WHERE embedding IS NOT NULL
+    ORDER BY score DESC LIMIT ?
+""", (query_embedding, limit))
+```
+
+### Database Lock Errors
+
+**Symptom:** `database is locked` errors during ingestion.
+
+**Solution:** The server uses thread-local connections. For ingestion, ensure no MCP clients are connected, or increase the timeout in `config.py`:
+```python
+DB_TIMEOUT = 60.0  # Increase from 30.0
+```
+
+### Vector Embeddings Not Working
+
+**Symptom:** Vector search returns no results or errors.
+
+**Check:**
+1. Embeddings exist: `sqlite3 db/emails.db "SELECT COUNT(*) FROM emails WHERE embedding IS NOT NULL;"`
+2. If 0, re-run ingestion to generate embeddings
+3. If errors, check that `sentence-transformers` model downloads correctly
 
 ---
 

@@ -35,9 +35,10 @@ LOG_DIR = BASE_DIR / "ingestion" / "logs"
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_DIMENSIONS = 384
-EMBEDDING_BATCH_SIZE = 64
+EMBEDDING_BATCH_SIZE = 16
 CHECKPOINT_INTERVAL = 500
 ZSTD_COMPRESSION_LEVEL = 3
+MAX_EMAILS = 1000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -580,18 +581,10 @@ def collect_email_files(maildir_path: Path) -> list[tuple[Path, str]]:
     for root, dirs, files in os.walk(maildir_path):
         dirs[:] = [d for d in dirs if not d.startswith('.')]
         
-        folder = "INBOX"
-        if '.Sent' in root or '/.Sent/' in root:
-            folder = "Sent"
-        elif '.Drafts' in root or '/.Drafts/' in root:
-            folder = "Drafts"
-        elif '.Trash' in root or '/.Trash/' in root:
-            folder = "Trash"
-        elif '.Sent Mail' in root:
-            folder = "Sent"
+        folder = "Archive"
         
         for file in files:
-            if file.endswith('.eml'):
+            if file.endswith('.eml') or (not file.startswith('.') and not file.endswith('.msf') and not file.endswith('.dat')):
                 full_path = Path(root) / file
                 eml_files.append((full_path, folder))
     
@@ -711,6 +704,10 @@ def ingest_emails(maildir_path: Path, resume: bool = True):
                     checkpoint['last_processed_path'] = rec.get('source_path', str(eml_path))
                 
                 logger.info(f"Processed {checkpoint['processed_count']}/{total_files} emails")
+                
+                if checkpoint['processed_count'] >= MAX_EMAILS:
+                    logger.info(f"Reached limit of {MAX_EMAILS} emails, stopping")
+                    break
                 
                 pending_records = []
                 pending_texts = []
