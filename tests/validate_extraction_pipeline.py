@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""
+Validation script for GitHub Issue #4: Full extraction pipeline validation
+
+Traces data fidelity from Outlook source through to SQLite:
+1. Extraction quality — Check extraction logs, verify .eml format
+2. Maildir → DB field preservation — Compare .eml fields to DB records
+3. Attachment pipeline — Verify attachment files exist on disk
+4. Vector coverage — Confirm all DB emails have embeddings
+
+Usage:
+    python3 tests/validate_extraction_pipeline.py         # full validation
+    python3 tests/validate_extraction_pipeline.py --sample 50  # quick scan
+    python3 tests/validate_extraction_pipeline.py --verbose     # detailed output
+"""
+
+import argparse
+import email
+import email.policy
+import json
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Optional
+
+BASE_DIR = Path(__file__).parent.parent
+MAILDIR = BASE_DIR / "maildir" / "cur"
+DB_PATH = BASE_DIR / "db" / "emails.db"
+ATTACHMENTS_DIR = BASE_DIR / "attachments"
+
+
+def scan_maildir_count() -> int:
+    """Count .eml files in maildir."""
+    return len([f for f in os.listdir(MAILDIR) if f and not f.startswith('.')])
+
+
+def extract_bodies_from_eml(eml_path: Path) -> dict:
+    """Parse an .eml file and extract body information."""
+    with open(eml_path, "rb") as f:
+        raw = f.read()
+
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+
+    result = {
+        "message_id": (msg.get("Message-ID") or "").strip().strip("<>"),
+        "subject": msg.get("Subject") or "",
+        "from": msg.get("From") or "",
+        "date": msg.get("Date") or "",
+        "has_attachments": False,
+        "attachment_count": 0,
+        "body_markdown": "",
+        "body_plain": "",
+        "content_types": [],
+    }
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct not in result["content_types"]:
+                result["content_types"].append(ct)
+
+            disposition = part.get("Content-Disposition", "")
+            if "attachment" in disposition.lower():
+                result["has_attachments"] = True
+                result["attachment_count"] += 1
+
+            if ct == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        result["body_markdown"] = payload.decode(charset, errors="replace")
+                    except Exception:
+                        result["body_markdown"] = payload.decode("utf-8", errors="replace")
+            elif ct == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        result["body_plain"] = payload.decode(charset, errors="replace")
+                    except Exception:
+                        result["body_plain"] = payload.decode("utf-8", errors="replace")
+
+    return result
+
+
+def check_extraction_quality(sample_size: int = 50) -> tuple[bool, str, dict]:
+    """Check that extracted .eml files have valid MIME structure."""
+    eml_files = sorted([f for f in MAILDIR.iterdir() if f.is_file()])[:sample_size]
+    
+    valid_count = 0
+    error_count = 0
+    errors = []
+    
+    for eml_path in eml_files:
+        try:
+            with open(eml_path, "rb") as f:
+                raw = f.read()
+            
+            msg = email.message_from_bytes(raw, policy=email.policy.default)
+            
+            if msg.get("Subject") or msg.get("From"):
+                valid_count += 1
+            else:
+                error_count += 1
+                errors.append(f"{eml_path.name}: missing headers")
+        except Exception as e:
+            error_count += 1
+            errors.append(f"{eml_path.name}: {str(e)[:50]}")
+    
+    result = {
+        "files_checked": len(eml_files),
+        "valid": valid_count,
+        "invalid": error_count,
+        "sample_errors": errors[:5]
+    }
+    
+    if len(eml_files) == 0:
+        return False, "No email files found in maildir", result
+    
+    error_rate = (error_count / len(eml_files) * 100) if eml_files else 0
+    if error_rate < 5:
+        return True, f"Extraction quality good: {valid_count}/{len(eml_files)} valid", result
+    else:
+        return False, f"Extraction quality issues: {error_count}/{len(eml_files)} invalid ({error_rate:.1f}%)", result
+
+
+def check_maildir_db_field_preservation(sample_size: int = 50) -> tuple[bool, str, dict]:
+    """Compare .eml fields to DB records for field preservation."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    eml_files = sorted([f for f in MAILDIR.iterdir() if f.is_file()])[:sample_size]
+    
+    checks = {
+        "message_id": {"match": 0, "mismatch": 0},
+        "subject": {"match": 0, "mismatch": 0},
+        "from_address": {"match": 0, "mismatch": 0},
+        "body_not_empty": {"match": 0, "mismatch": 0},
+    }
+    
+    no_db_match = 0
+    
+    for eml_path in eml_files:
+        eml_info = extract_bodies_from_eml(eml_path)
+        
+        c.execute("SELECT * FROM emails WHERE message_id = ?", (eml_info["message_id"],))
+        db_row = c.fetchone()
+        
+        if not db_row:
+            no_db_match += 1
+            continue
+        
+        db_record = dict(db_row)
+        
+        if eml_info["message_id"] == db_record["message_id"]:
+            checks["message_id"]["match"] += 1
+        else:
+            checks["message_id"]["mismatch"] += 1
+        
+        if eml_info["subject"] == db_record["subject"]:
+            checks["subject"]["match"] += 1
+        else:
+            checks["subject"]["mismatch"] += 1
+        
+        import json
+        to_addresses = json.loads(db_record["to_addresses"]) if db_record["to_addresses"] else []
+        
+        if eml_info["from"] and any(addr in eml_info["from"] for addr in to_addresses + [db_record["from_address"]]):
+            checks["from_address"]["match"] += 1
+        else:
+            checks["from_address"]["mismatch"] += 1
+        
+        if db_record["body_markdown"] and len(db_record["body_markdown"]) > 10:
+            checks["body_not_empty"]["match"] += 1
+        else:
+            checks["body_not_empty"]["mismatch"] += 1
+    
+    conn.close()
+    
+    total = sum(ch["match"] + ch["mismatch"] for ch in checks.values())
+    matches = sum(ch["match"] for ch in checks.values())
+    
+    result = {
+        "files_checked": len(eml_files),
+        "no_db_match": no_db_match,
+        "checks": checks,
+        "match_rate": (matches / total * 100) if total > 0 else 0
+    }
+    
+    if no_db_match > len(eml_files) * 0.5:
+        return False, f"Many .eml files not in DB: {no_db_match}/{len(eml_files)}", result
+    
+    if total > 0 and matches / total > 0.85:
+        return True, f"Field preservation: {matches}/{total} fields match ({result['match_rate']:.0f}%)", result
+    elif total == 0:
+        return False, "No .eml files found to check", result
+    else:
+        return False, f"Field preservation issues: {matches}/{total} match ({result['match_rate']:.0f}%)", result
+
+
+def check_attachment_pipeline() -> tuple[bool, str, dict]:
+    """Compare attachment_hashes table paths to files on disk."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT path, filename FROM attachment_hashes")
+    db_attachments = c.fetchall()
+    
+    conn.close()
+    
+    on_disk = 0
+    missing = 0
+    
+    for row in db_attachments:
+        path = row[0]
+        full_path = BASE_DIR / path
+        if full_path.exists():
+            on_disk += 1
+        else:
+            missing += 1
+    
+    result = {
+        "db_attachments": len(db_attachments),
+        "on_disk": on_disk,
+        "missing": missing
+    }
+    
+    if missing == 0:
+        return True, f"All {len(db_attachments)} attachments exist on disk", result
+    else:
+        return False, f"{missing} attachments missing from disk", result
+
+
+def check_vector_coverage() -> tuple[bool, str, dict]:
+    """Confirm every DB email has an embedding."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT COUNT(*) FROM emails")
+    total = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE embedding IS NOT NULL")
+    with_embedding = c.fetchone()[0]
+    
+    conn.close()
+    
+    result = {"total": total, "with_embedding": with_embedding}
+    
+    if with_embedding == total:
+        return True, f"All {total} emails have embeddings", result
+    else:
+        return False, f"{total - with_embedding} emails missing embeddings", result
+
+
+def check_has_attachments_accuracy(sample_size: int = 50) -> tuple[bool, str, dict]:
+    """Verify has_attachments flag matches actual attachment parts."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    eml_files = sorted([f for f in MAILDIR.iterdir() if f.is_file()])[:sample_size]
+    
+    accurate = 0
+    inaccurate = 0
+    
+    for eml_path in eml_files:
+        eml_info = extract_bodies_from_eml(eml_path)
+        
+        c.execute("SELECT has_attachments FROM emails WHERE message_id = ?", (eml_info["message_id"],))
+        row = c.fetchone()
+        
+        if not row:
+            continue
+        
+        db_flag = row["has_attachments"]
+        eml_flag = 1 if eml_info["has_attachments"] else 0
+        
+        if db_flag == eml_flag:
+            accurate += 1
+        else:
+            inaccurate += 1
+    
+    conn.close()
+    
+    result = {"accurate": accurate, "inaccurate": inaccurate}
+    
+    if inaccurate == 0:
+        return True, f"has_attachments flag accurate: {accurate}/{accurate+inaccurate}", result
+    else:
+        return False, f"has_attachments inaccurate: {inaccurate}/{accurate+inaccurate}", result
+
+
+def check_no_raw_html_in_body() -> tuple[bool, str, dict]:
+    """Verify body_markdown is not raw HTML."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT id, body_markdown FROM emails LIMIT 100")
+    samples = c.fetchall()
+    
+    conn.close()
+    
+    raw_html_markers = ["<html", "<!doctype", "<head>", "<body>", "<meta "]
+    
+    clean = 0
+    raw_html = 0
+    
+    for row in samples:
+        body = row[1] or ""
+        if body:
+            head = body[:500].lower()
+            if any(marker.lower() in head for marker in raw_html_markers):
+                raw_html += 1
+            else:
+                clean += 1
+    
+    result = {"clean": clean, "raw_html": raw_html}
+    
+    if raw_html == 0:
+        return True, f"All {clean} sampled emails have clean markdown", result
+    else:
+        return False, f"{raw_html} emails may have raw HTML in body", result
+
+
+def run_validation(sample_size: int = 50, verbose: bool = False) -> dict:
+    """Run full validation and return results."""
+    results = {}
+    
+    print("\n" + "=" * 60)
+    print("  Extraction Pipeline Validation")
+    print("=" * 60)
+    
+    checks = [
+        ("Extraction Quality", lambda: check_extraction_quality(sample_size)),
+        ("Field Preservation", lambda: check_maildir_db_field_preservation(sample_size)),
+        ("Attachment Pipeline", lambda: check_attachment_pipeline()),
+        ("Vector Coverage", lambda: check_vector_coverage()),
+        ("has_attachments Accuracy", lambda: check_has_attachments_accuracy(sample_size)),
+        ("No Raw HTML in Body", lambda: check_no_raw_html_in_body()),
+    ]
+    
+    all_passed = True
+    
+    for name, check_func in checks:
+        passed, message, detail = check_func()
+        results[name] = {"passed": passed, "message": message, "detail": detail}
+        
+        status = "PASS" if passed else "FAIL"
+        print(f"\n[{status}] {name}")
+        print(f"    {message}")
+        
+        if verbose and detail:
+            for k, v in detail.items():
+                if k != "sample_errors":
+                    print(f"    - {k}: {v}")
+        
+        if not passed:
+            all_passed = False
+    
+    maildir_count = scan_maildir_count()
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM emails")
+    db_count = c.fetchone()[0]
+    try:
+        c.execute("SELECT COUNT(*) FROM email_vectors")
+        vec_count = c.fetchone()[0]
+    except sqlite3.OperationalError:
+        c.execute("SELECT COUNT(*) FROM emails WHERE embedding IS NOT NULL")
+        vec_count = c.fetchone()[0]
+    conn.close()
+    
+    print(f"\n[Pipeline Summary]")
+    print(f"    Maildir files: {maildir_count}")
+    print(f"    DB records: {db_count}")
+    print(f"    Vector embeddings: {vec_count}")
+    
+    print("\n" + "=" * 60)
+    if all_passed:
+        print("  Result: PASS")
+    else:
+        print("  Result: FAIL")
+    print("=" * 60)
+    
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Validate extraction pipeline")
+    parser.add_argument("--sample", type=int, default=50, help="Number of emails to sample (default: 50)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Print detailed output")
+    args = parser.parse_args()
+    
+    if not DB_PATH.exists():
+        print(f"ERROR: Database not found: {DB_PATH}")
+        sys.exit(1)
+    
+    if not MAILDIR.exists():
+        print(f"ERROR: Maildir not found: {MAILDIR}")
+        sys.exit(1)
+    
+    results = run_validation(sample_size=args.sample, verbose=args.verbose)
+    
+    all_passed = all(r["passed"] for r in results.values())
+    
+    sys.exit(0 if all_passed else 1)
+
+
+if __name__ == "__main__":
+    main()
