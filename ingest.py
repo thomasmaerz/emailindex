@@ -116,7 +116,12 @@ class EncodingHandler:
             charset = message.get_content_charset() or 'utf-8'
             payload = message.get_payload(decode=True)
             if payload and isinstance(payload, bytes):
-                plain_body = cls._decode_payload(payload, charset)
+                text = cls._decode_payload(payload, charset)
+                content_type = message.get_content_type()
+                if content_type == 'text/html':
+                    html_body = text
+                elif content_type == 'text/plain':
+                    plain_body = text
         
         return html_body, plain_body
 
