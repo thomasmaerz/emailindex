@@ -420,18 +420,40 @@ def is_duplicate_message_id(conn: sqlite3.Connection, message_id: str) -> bool:
 
 def process_attachments(message: Message, email_id: str, thread_id: Optional[str], timestamp: str, db_conn: Optional[sqlite3.Connection]) -> list[dict]:
     import mimetypes
+    import re as regex_module
     mimetypes.init()
     
     attachments = []
     
+    content_ids = set()
+    for part in message.walk():
+        cid = part.get('Content-ID')
+        if cid:
+            content_ids.add(cid.strip('<>'))
+    
+    html_body, _ = EncodingHandler.get_message_body(message)
+    cid_refs = set(regex_module.findall(r'cid:([^"\'>\s]+)', html_body or ''))
+    
     for part in message.walk():
         content_disposition = part.get('Content-Disposition', '')
+        disposition_lower = content_disposition.lower().strip()
         
-        if 'inline' in content_disposition.lower():
+        if not disposition_lower:
             continue
         
-        if 'attachment' not in content_disposition.lower():
+        is_attachment = 'attachment' in disposition_lower
+        is_inline = 'inline' in disposition_lower
+        
+        if not is_attachment and not is_inline:
             continue
+        
+        if is_inline and not is_attachment:
+            filename = part.get_filename()
+            if not filename:
+                continue
+            cid = part.get('Content-ID', '').strip('<>')
+            if cid in cid_refs:
+                continue
         
         try:
             filename = part.get_filename()
@@ -460,8 +482,8 @@ def process_attachments(message: Message, email_id: str, thread_id: Optional[str
                 cursor = db_conn.cursor()
                 cursor.execute("SELECT path FROM attachment_hashes WHERE sha256 = ?", (sha256_hash,))
                 row = cursor.fetchone()
-                if row:
-                    existing_path = row['path']
+                if row and row[0]:
+                    existing_path = row[0]
             
             if existing_path:
                 rel_path = Path(existing_path)
@@ -471,10 +493,7 @@ def process_attachments(message: Message, email_id: str, thread_id: Optional[str
                 full_path.parent.mkdir(parents=True, exist_ok=True)
                 
                 if full_path.exists():
-                    name, ext = os.path.splitext(filename)
-                    safe_filename = f"{name}_{sha256_hash[:8]}{ext}"
-                    rel_path = get_attachment_path(thread_id, timestamp, safe_filename)
-                    full_path = BASE_DIR / rel_path
+                    full_path.unlink()
                 
                 with open(full_path, 'wb') as f:
                     f.write(content)
