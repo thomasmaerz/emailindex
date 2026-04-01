@@ -47,7 +47,7 @@ class MCPServer:
         
         return [r.model_dump() for r in results]
     
-    def tool_get_email(self, params: dict) -> dict:
+    def tool_get_email(self, params: dict) -> dict | None:
         try:
             email_params = GetEmailParams(**params)
         except Exception as e:
@@ -65,7 +65,7 @@ class MCPServer:
         
         return result
     
-    def tool_get_conversation(self, params: dict) -> dict:
+    def tool_get_conversation(self, params: dict) -> dict | None:
         try:
             conv_params = GetConversationParams(**params)
         except Exception as e:
@@ -97,10 +97,17 @@ class MCPServer:
         
         return [r.model_dump() for r in results]
     
-    def handle_request(self, request: dict) -> dict:
+    def handle_request(self, request: dict) -> dict | None:
         method = request.get("method")
         params = request.get("params", {})
         request_id = request.get("id")
+        
+        # Handle notifications (no response needed)
+        if method == "notifications/initialized":
+            return None
+        
+        if method == "notifications/cancelled":
+            return None
         
         if method == "initialize":
             return {
@@ -120,6 +127,20 @@ class MCPServer:
         
         if method == "initialized":
             return {"jsonrpc": "2.0", "id": request_id, "result": None}
+        
+        if method == "prompts/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"prompts": []}
+            }
+        
+        if method == "resources/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"resources": []}
+            }
         
         if method == "tools/list":
             return {
@@ -192,9 +213,20 @@ class MCPServer:
             
             try:
                 result = self.tools[tool_name](tool_params)
-                return {"jsonrpc": "2.0", "id": request_id, "result": result}
+                
+                # Wrap result in MCP CallToolResult format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2)
+                        }
+                    ]
+                }
+                
+                return {"jsonrpc": "2.0", "id": request_id, "result": mcp_result}
             except Exception as e:
-                return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": str(e)}}
+                return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": f"Error: {str(e)}"}], "isError": True}}
         
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}}
 
@@ -212,7 +244,8 @@ def main():
             try:
                 request = json.loads(line)
                 response = server.handle_request(request)
-                print(json.dumps(response), flush=True)
+                if response is not None:
+                    print(json.dumps(response), flush=True)
             except json.JSONDecodeError:
                 print(json.dumps({"error": "Invalid JSON"}), flush=True)
             except Exception as e:
@@ -231,7 +264,8 @@ def main():
             try:
                 request = json.loads(line)
                 response = server.handle_request(request)
-                print(json.dumps(response), flush=True)
+                if response is not None:
+                    print(json.dumps(response), flush=True)
             except json.JSONDecodeError:
                 print(json.dumps({"error": "Invalid JSON"}), flush=True)
             except Exception as e:

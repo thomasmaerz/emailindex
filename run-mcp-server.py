@@ -47,7 +47,8 @@ for line in sys.stdin:
             f.write(f'SEND: {str(response)[:100]} at {time.time()}\n')
             f.flush()
         
-        print(json.dumps(response), flush=True)
+        if response is not None:
+            print(json.dumps(response), flush=True)
     except json.JSONDecodeError as e:
         with open('/tmp/mcp_start.log', 'a') as f:
             f.write(f'JSON ERROR: {e} at {time.time()}\n')

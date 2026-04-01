@@ -202,6 +202,10 @@ class ThreadHandler:
         elif reply_ids:
             root_id = reply_ids[0]
         else:
+            outlook_tid = message.get('X-Outlook-Thread-ID', '')
+            if outlook_tid:
+                thread_hash = hashlib.sha256(outlook_tid.encode()).hexdigest()[:16]
+                return f"thread-{thread_hash}"
             return None
         
         thread_hash = hashlib.sha256(root_id.encode()).hexdigest()[:16]
@@ -443,29 +447,46 @@ def process_attachments(message: Message, email_id: str, thread_id: Optional[str
                 continue
             
             sha256_hash = compute_sha256(content)
+            mime_type = mimetypes.guess_type(filename)[0] or part.get_content_type() or 'application/octet-stream'
+            content_size = len(content)
             
-            rel_path = get_attachment_path(thread_id, timestamp, filename)
-            full_path = BASE_DIR / rel_path
-            full_path.parent.mkdir(parents=True, exist_ok=True)
+            existing_path = None
+            if db_conn:
+                cursor = db_conn.cursor()
+                cursor.execute("SELECT path FROM attachment_hashes WHERE sha256 = ?", (sha256_hash,))
+                row = cursor.fetchone()
+                if row:
+                    existing_path = row['path']
             
-            if not full_path.exists():
+            if existing_path:
+                rel_path = Path(existing_path)
+            else:
+                rel_path = get_attachment_path(thread_id, timestamp, filename)
+                full_path = BASE_DIR / rel_path
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                if full_path.exists():
+                    name, ext = os.path.splitext(filename)
+                    safe_filename = f"{name}_{sha256_hash[:8]}{ext}"
+                    rel_path = get_attachment_path(thread_id, timestamp, safe_filename)
+                    full_path = BASE_DIR / rel_path
+                
                 with open(full_path, 'wb') as f:
                     f.write(content)
                 
                 if db_conn:
-                    mime_type = mimetypes.guess_type(filename)[0] or part.get_content_type() or 'application/octet-stream'
                     cursor = db_conn.cursor()
                     cursor.execute(
-                        """INSERT INTO attachment_hashes (sha256, first_email_id, path, filename, mime_type, size_bytes, created_at)
+                        """INSERT OR IGNORE INTO attachment_hashes (sha256, first_email_id, path, filename, mime_type, size_bytes, created_at)
                            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (sha256_hash, email_id, str(rel_path), filename, mime_type, len(content), datetime.now(timezone.utc).isoformat())
+                        (sha256_hash, email_id, str(rel_path), filename, mime_type, content_size, datetime.now(timezone.utc).isoformat())
                     )
             
             attachments.append({
                 'filename': filename,
                 'path': str(rel_path),
-                'mime_type': mimetypes.guess_type(filename)[0] or part.get_content_type() or 'application/octet-stream',
-                'size_bytes': len(content),
+                'mime_type': mime_type,
+                'size_bytes': content_size,
                 'sha256': sha256_hash
             })
         

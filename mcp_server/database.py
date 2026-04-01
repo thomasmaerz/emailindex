@@ -98,9 +98,15 @@ def search_emails(
     # Full-text search (with optional hybrid vector scoring)
     fts_only = False
     if query:
-        fts_only = True
-        where_clauses.append("e.rowid IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)")
-        params.append(query)
+        # Sanitize query to avoid FTS5/sqlite-vec issues
+        safe_query = query.strip()
+        if safe_query == "*" or not safe_query:
+            # Skip FTS if query is just "*" or empty
+            pass
+        else:
+            fts_only = True
+            where_clauses.append("e.rowid IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)")
+            params.append(safe_query)
     
     if date_from:
         where_clauses.append("e.timestamp >= ?")
