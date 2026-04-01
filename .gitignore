@@ -153,6 +153,8 @@ cython_debug/
 db/emails.db
 db/emails.db-journal
 ingestion/resume.json
+ingestion/resume_classification.json
 ingestion/logs/
 attachments/
 maildir/
+.worktrees/
