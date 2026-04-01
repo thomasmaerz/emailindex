@@ -18,6 +18,8 @@ class Config:
     
     ZSTD_COMPRESSION_LEVEL = 3
     
+    USER_EMAIL_ADDRESSES: list[str] = []  # Configure with your email addresses
+    
     MCP_SERVER_NAME = "email-intelligence"
     MCP_SERVER_VERSION = "1.0.0"
     
