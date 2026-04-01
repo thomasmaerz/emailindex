@@ -11,9 +11,10 @@ from pathlib import Path
 
 from .models import (
     EmailRecord, EmailSearchResult, ConversationThread,
-    SearchParams, GetEmailParams, GetConversationParams, FindRecipientParams
+    SearchParams, GetEmailParams, GetConversationParams, FindRecipientParams,
+    QueryEmailParams, GetProjectContextParams
 )
-from .database import search_emails, get_email, get_conversation, find_recipient_emails
+from .database import search_emails, get_email, get_conversation, find_recipient_emails, query_email_database, get_project_context
 from .config import Config
 
 
@@ -21,81 +22,48 @@ class MCPServer:
     def __init__(self):
         Config.ensure_directories()
         self.tools = {
-            "search_emails": self.tool_search_emails,
-            "get_email": self.tool_get_email,
-            "get_conversation": self.tool_get_conversation,
-            "find_recipient_emails": self.tool_find_recipient_emails,
+            "query_email_database": self.tool_query_email_database,
+            "get_project_context": self.tool_get_project_context,
         }
     
-    def tool_search_emails(self, params: dict) -> list[dict]:
+    def tool_query_email_database(self, params: dict) -> dict:
         try:
-            search_params = SearchParams(**params)
-        except Exception as e:
-            return [{"error": str(e)}]
-        
-        results = search_emails(
-            query=search_params.query,
-            date_from=search_params.date_from,
-            date_to=search_params.date_to,
-            from_address=search_params.from_address,
-            to_address=search_params.to_address,
-            has_attachments=search_params.has_attachments,
-            folder=search_params.folder,
-            limit=search_params.limit,
-            similar_to_email_id=search_params.similar_to_email_id
-        )
-        
-        return [r.model_dump() for r in results]
-    
-    def tool_get_email(self, params: dict) -> dict | None:
-        try:
-            email_params = GetEmailParams(**params)
+            query_params = QueryEmailParams(**params)
         except Exception as e:
             return {"error": str(e)}
         
-        email = get_email(email_params.email_id)
+        results = query_email_database(
+            semantic_query=query_params.semantic_query,
+            exact_keywords=query_params.exact_keywords,
+            category_filter=query_params.category_filter,
+            project_filter=query_params.project_filter,
+            date_from=query_params.date_from,
+            date_to=query_params.date_to,
+            from_address=query_params.from_address,
+            to_address=query_params.to_address,
+            is_outbound=query_params.is_outbound,
+            has_attachments=query_params.has_attachments,
+            limit=query_params.limit,
+            include_full_thread=query_params.include_full_thread
+        )
         
-        if email is None:
-            return None
-        
-        result = email.model_dump()
-        
-        if result.get('raw_eml') and isinstance(result['raw_eml'], bytes):
-            result['raw_eml'] = "[compressed]"
-        
-        return result
+        return results
     
-    def tool_get_conversation(self, params: dict) -> dict | None:
+    def tool_get_project_context(self, params: dict) -> dict | None:
         try:
-            conv_params = GetConversationParams(**params)
+            project_params = GetProjectContextParams(**params)
         except Exception as e:
             return {"error": str(e)}
         
-        conversation = get_conversation(conv_params.thread_id)
-        
-        if conversation is None:
-            return None
-        
-        result = conversation.model_dump()
-        
-        for email in result.get('emails', []):
-            if email.get('raw_eml') and isinstance(email.get('raw_eml'), bytes):
-                email['raw_eml'] = "[compressed]"
-        
-        return result
-    
-    def tool_find_recipient_emails(self, params: dict) -> list[dict]:
-        try:
-            recipient_params = FindRecipientParams(**params)
-        except Exception as e:
-            return [{"error": str(e)}]
-        
-        results = find_recipient_emails(
-            recipient_params.email_address,
-            recipient_params.limit
+        result = get_project_context(
+            project_params.project_name,
+            project_params.limit
         )
         
-        return [r.model_dump() for r in results]
+        if result is None:
+            return None
+        
+        return result
     
     def handle_request(self, request: dict) -> dict | None:
         method = request.get("method")
@@ -149,55 +117,36 @@ class MCPServer:
                 "result": {
                     "tools": [
                         {
-                            "name": "search_emails",
-                            "description": "Search emails using full-text, vector similarity, or metadata filters",
+                            "name": "query_email_database",
+                            "description": "Unified email search with FTS5 tag filtering, vector similarity, and metadata filters",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "query": {"type": "string", "description": "Full-text or semantic search query"},
-                                    "date_from": {"type": "string", "description": "Start date (ISO 8601 or YYYY-MM-DD)"},
-                                    "date_to": {"type": "string", "description": "End date"},
-                                    "from_address": {"type": "string", "description": "Filter by sender email"},
-                                    "to_address": {"type": "string", "description": "Filter by recipient email"},
-                                    "has_attachments": {"type": "boolean", "description": "Filter by attachment presence"},
-                                    "folder": {"type": "string", "description": "Filter by Maildir folder"},
-                                    "limit": {"type": "integer", "description": "Max results (1-1000)", "default": 20},
-                                    "similar_to_email_id": {"type": "string", "description": "Find emails similar to this email ID"}
+                                    "semantic_query": {"type": "string", "description": "Vector search text"},
+                                    "exact_keywords": {"type": "string", "description": "FTS5 match"},
+                                    "category_filter": {"type": "string", "description": "Comma-separated categories"},
+                                    "project_filter": {"type": "string", "description": "Comma-separated projects"},
+                                    "date_from": {"type": "string", "description": "Start date ISO 8601"},
+                                    "date_to": {"type": "string", "description": "End date ISO 8601"},
+                                    "from_address": {"type": "string", "description": "Filter by sender"},
+                                    "to_address": {"type": "string", "description": "Filter by recipient"},
+                                    "is_outbound": {"type": "boolean", "description": "Filter by direction"},
+                                    "has_attachments": {"type": "boolean", "description": "Filter by attachments"},
+                                    "limit": {"type": "integer", "description": "Max results (1-50)", "default": 10},
+                                    "include_full_thread": {"type": "boolean", "description": "Return full thread", "default": False}
                                 }
                             }
                         },
                         {
-                            "name": "get_email",
-                            "description": "Retrieve complete email by ID",
+                            "name": "get_project_context",
+                            "description": "Get project metadata and relevant emails from project registry",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "email_id": {"type": "string", "description": "UUIDv4 of the email"}
+                                    "project_name": {"type": "string", "description": "Project name or alias"},
+                                    "limit": {"type": "integer", "description": "Max emails to return (1-50)", "default": 10}
                                 },
-                                "required": ["email_id"]
-                            }
-                        },
-                        {
-                            "name": "get_conversation",
-                            "description": "Retrieve all emails in a thread",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "thread_id": {"type": "string", "description": "Thread ID from References header chain"}
-                                },
-                                "required": ["thread_id"]
-                            }
-                        },
-                        {
-                            "name": "find_recipient_emails",
-                            "description": "Find all emails involving a specific email address",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "email_address": {"type": "string", "description": "Email address to search"},
-                                    "limit": {"type": "integer", "description": "Max results (1-1000)", "default": 50}
-                                },
-                                "required": ["email_address"]
+                                "required": ["project_name"]
                             }
                         }
                     ]
