@@ -270,3 +270,256 @@ def find_recipient_emails(email_address: str, limit: int = 50) -> list[EmailSear
         )
         for row in results
     ]
+
+
+def query_email_database(
+    semantic_query: Optional[str] = None,
+    exact_keywords: Optional[str] = None,
+    category_filter: Optional[str] = None,
+    project_filter: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    from_address: Optional[str] = None,
+    to_address: Optional[str] = None,
+    is_outbound: Optional[bool] = None,
+    has_attachments: Optional[bool] = None,
+    limit: int = 10,
+    include_full_thread: bool = False
+) -> dict:
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    where_clauses = []
+    params = []
+    
+    if semantic_query:
+        cursor.execute("SELECT embedding FROM emails WHERE embedding IS NOT NULL LIMIT 1")
+        if cursor.fetchone():
+            try:
+                cursor.execute("""
+                    SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address,
+                           e.from_name, e.has_attachments, e.folder, e.body_markdown,
+                           vec_distance_cosine(e.embedding, (
+                               SELECT embedding FROM emails WHERE id = (
+                                   SELECT id FROM emails WHERE embedding IS NOT NULL LIMIT 1
+                               )
+                           )) as score
+                    FROM emails e
+                    WHERE e.embedding IS NOT NULL
+                    ORDER BY score DESC
+                    LIMIT ?
+                """, (limit * 3,))
+                
+                vector_results = cursor.fetchall()
+                
+                results = []
+                thread_ids = set()
+                for r in vector_results[:limit]:
+                    results.append({
+                        "id": r["id"],
+                        "thread_id": r["thread_id"],
+                        "subject": r["subject"],
+                        "timestamp": r["timestamp"],
+                        "from_address": r["from_address"],
+                        "from_name": r["from_name"],
+                        "snippet": r["body_markdown"][:500] if r["body_markdown"] else "",
+                        "score": r["score"],
+                        "has_attachments": bool(r["has_attachments"]),
+                        "folder": r["folder"]
+                    })
+                    if r["thread_id"]:
+                        thread_ids.add(r["thread_id"])
+                
+                if include_full_thread and thread_ids:
+                    cursor.execute("""
+                        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address,
+                               e.from_name, e.has_attachments, e.folder, e.body_markdown
+                        FROM emails e
+                        WHERE e.thread_id IN ({})
+                        ORDER BY e.timestamp ASC
+                    """.format(",".join(["?"] * len(thread_ids))), list(thread_ids))
+                    
+                    thread_emails = cursor.fetchall()
+                    threads = {}
+                    for te in thread_emails:
+                        tid = te["thread_id"]
+                        if tid not in threads:
+                            threads[tid] = []
+                        threads[tid].append({
+                            "id": te["id"],
+                            "subject": te["subject"],
+                            "timestamp": te["timestamp"],
+                            "from_address": te["from_address"],
+                            "from_name": te["from_name"],
+                            "snippet": te["body_markdown"][:500] if te["body_markdown"] else "",
+                        })
+                    
+                    close_connection()
+                    return {"results": results, "threads": threads}
+                
+                close_connection()
+                return {"results": results}
+            except Exception:
+                pass
+    
+    if exact_keywords:
+        safe_query = exact_keywords.strip()
+        if safe_query:
+            where_clauses.append("e.rowid IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)")
+            params.append(safe_query)
+    
+    if category_filter or project_filter:
+        tags = []
+        if category_filter:
+            tags.extend([c.strip() for c in category_filter.split(",")])
+        if project_filter:
+            tags.extend([p.strip() for p in project_filter.split(",")])
+        
+        if tags:
+            tag_conditions = " OR ".join(["category_tags LIKE ?" for _ in tags])
+            tag_conditions += " OR " + " OR ".join(["project_tags LIKE ?" for _ in tags])
+            where_clauses.append(f"({tag_conditions})")
+            for _ in tags:
+                params.extend([f"%{t}%" for t in tags])
+    
+    if date_from:
+        where_clauses.append("e.timestamp >= ?")
+        params.append(date_from)
+    
+    if date_to:
+        where_clauses.append("e.timestamp <= ?")
+        params.append(date_to)
+    
+    if from_address:
+        where_clauses.append("e.sender = ?")
+        params.append(from_address)
+    
+    if to_address:
+        where_clauses.append("e.recipients LIKE ?")
+        params.append(f"%{to_address}%")
+    
+    if is_outbound is not None:
+        where_clauses.append("e.is_outbound = ?")
+        params.append(1 if is_outbound else 0)
+    
+    if has_attachments is not None:
+        where_clauses.append("e.has_attachments = ?")
+        params.append(1 if has_attachments else 0)
+    
+    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+    
+    sql = f"""
+        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+               e.category_tags, e.project_tags, e.has_attachments, e.folder,
+               COALESCE(e.body_text, e.body_markdown) as body_text
+        FROM emails e
+        WHERE {where_sql}
+        ORDER BY e.timestamp DESC
+        LIMIT ?
+    """
+    params.append(limit)
+    
+    cursor.execute(sql, params)
+    results = cursor.fetchall()
+    
+    output = []
+    thread_ids = set()
+    for row in results:
+        output.append({
+            "id": row["id"],
+            "thread_id": row["thread_id"],
+            "subject": row["subject"],
+            "timestamp": row["timestamp"],
+            "from_address": row["from_address"],
+            "category_tags": row["category_tags"],
+            "project_tags": row["project_tags"],
+            "snippet": row["body_text"][:500] if row["body_text"] else "",
+            "has_attachments": bool(row["has_attachments"]),
+            "folder": row["folder"]
+        })
+        if row["thread_id"]:
+            thread_ids.add(row["thread_id"])
+    
+    if include_full_thread and thread_ids:
+        cursor.execute("""
+            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                   e.body_text
+            FROM emails e
+            WHERE e.thread_id IN ({})
+            ORDER BY e.timestamp ASC
+        """.format(",".join(["?"] * len(thread_ids))), list(thread_ids))
+        
+        thread_emails = cursor.fetchall()
+        threads = {}
+        for te in thread_emails:
+            tid = te["thread_id"]
+            if tid not in threads:
+                threads[tid] = []
+            threads[tid].append({
+                "id": te["id"],
+                "subject": te["subject"],
+                "timestamp": te["timestamp"],
+                "from_address": te["from_address"],
+                "snippet": te["body_text"][:500] if te["body_text"] else "",
+            })
+        
+        close_connection()
+        return {"results": output, "threads": threads}
+    
+    close_connection()
+    return {"results": output}
+
+
+def get_project_context(project_name: str, limit: int = 10) -> Optional[dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT name, aliases, summary, created_at
+        FROM project_registry
+        WHERE name = ? OR aliases LIKE ?
+    """, (project_name, f"%{project_name}%"))
+    
+    row = cursor.fetchone()
+    if not row:
+        close_connection()
+        return None
+    
+    project = {
+        "name": row["name"],
+        "aliases": row["aliases"],
+        "summary": row["summary"],
+        "created_at": row["created_at"]
+    }
+    
+    cursor.execute("""
+        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+               e.category_tags, e.project_tags, e.has_attachments, e.folder,
+               COALESCE(e.body_text, e.body_markdown) as body_text
+        FROM emails e
+        WHERE e.project_tags LIKE ?
+        ORDER BY e.timestamp DESC
+        LIMIT ?
+    """, (f"%{row['name']}%", limit))
+    
+    results = []
+    for row in cursor.fetchall():
+        results.append({
+            "id": row["id"],
+            "thread_id": row["thread_id"],
+            "subject": row["subject"],
+            "timestamp": row["timestamp"],
+            "from_address": row["from_address"],
+            "category_tags": row["category_tags"],
+            "project_tags": row["project_tags"],
+            "snippet": row["body_text"][:500] if row["body_text"] else "",
+            "has_attachments": bool(row["has_attachments"]),
+            "folder": row["folder"]
+        })
+    
+    close_connection()
+    
+    return {
+        "project": project,
+        "emails": results
+    }

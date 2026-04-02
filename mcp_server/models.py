@@ -13,6 +13,7 @@ class AttachmentRecord(BaseModel):
     mime_type: str = Field(..., description="MIME type")
     size_bytes: Optional[int] = Field(None, description="File size in bytes")
     sha256: Optional[str] = Field(None, description="SHA-256 hash for deduplication")
+    is_visual: bool = Field(default=False, description="True for images (png, jpg, gif, svg)")
     
     @field_validator('path')
     @classmethod
@@ -43,6 +44,16 @@ class EmailRecord(BaseModel):
     
     has_attachments: bool = Field(..., description="Whether email has attachments")
     attachments: list[AttachmentRecord] = Field(default_factory=list)
+    
+    parent_id: Optional[str] = Field(None, description="UUID of parent for salvaged replies")
+    source: str = Field(default="original", description="original or quoted_reply")
+    content_hash: Optional[str] = Field(None, description="SHA-256 of normalized body")
+    sender: str = Field(..., description="Canonical sender address")
+    recipients: list[str] = Field(default_factory=list, description="All recipients")
+    body_text: str = Field(..., description="Cleaned content")
+    category_tags: list[str] = Field(default_factory=list, description="Category tags")
+    project_tags: list[str] = Field(default_factory=list, description="Project tags")
+    is_outbound: bool = Field(default=False, description="True if sender is user")
     
     folder: str = Field(..., description="Maildir folder name")
     raw_eml: Optional[bytes] = Field(None, description="Zstd-compressed raw .eml bytes")
@@ -77,6 +88,15 @@ class EmailRecord(BaseModel):
             x_mailer=row.get('x_mailer'),
             has_attachments=bool(row.get('has_attachments', 0)),
             attachments=attachments,
+            parent_id=row.get('parent_id'),
+            source=row.get('source', 'original'),
+            content_hash=row.get('content_hash'),
+            sender=row.get('sender', row.get('from_address', '')),
+            recipients=json.loads(row.get('recipients', '[]')) if row.get('recipients') else to_addresses,
+            body_text=row.get('body_text', row.get('body_markdown', '')),
+            category_tags=json.loads(row.get('category_tags', '[]')) if row.get('category_tags') else [],
+            project_tags=json.loads(row.get('project_tags', '[]')) if row.get('project_tags') else [],
+            is_outbound=bool(row.get('is_outbound', 0)),
             folder=row.get('folder', 'INBOX'),
             raw_eml=row.get('raw_eml')
         )
@@ -178,3 +198,27 @@ class FindRecipientParams(BaseModel):
         if not re.match(pattern, v):
             raise ValueError('email_address must be a valid email address')
         return v
+
+
+class QueryEmailParams(BaseModel):
+    model_config = ConfigDict(strict=True)
+    
+    semantic_query: Optional[str] = Field(None, description="Vector search text")
+    exact_keywords: Optional[str] = Field(None, description="FTS5 match")
+    category_filter: Optional[str] = Field(None, description="Comma-separated categories")
+    project_filter: Optional[str] = Field(None, description="Comma-separated projects")
+    date_from: Optional[str] = Field(None, description="Start date ISO 8601")
+    date_to: Optional[str] = Field(None, description="End date ISO 8601")
+    from_address: Optional[str] = Field(None, description="Filter by sender")
+    to_address: Optional[str] = Field(None, description="Filter by recipient")
+    is_outbound: Optional[bool] = Field(None, description="Filter by direction")
+    has_attachments: Optional[bool] = Field(None, description="Filter by attachments")
+    limit: int = Field(10, ge=1, le=50, description="Max results")
+    include_full_thread: bool = Field(default=False, description="Return full thread")
+
+
+class GetProjectContextParams(BaseModel):
+    model_config = ConfigDict(strict=True)
+    
+    project_name: str = Field(..., description="Project name or alias")
+    limit: int = Field(10, ge=1, le=50, description="Max emails to return")
