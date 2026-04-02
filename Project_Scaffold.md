@@ -1,8 +1,8 @@
 # Email Intelligence System - Project Scaffold
 
-**Version:** 1.0.0  
-**Last Updated:** 2026-03-30  
-**Status:** Locked Architecture
+**Version:** 2.0.0  
+**Last Updated:** 2026-04-02  
+**Status:** Production - v2 schema with vector search
 
 ---
 
@@ -15,68 +15,49 @@ emailindex/
 │       └── {MM_Mon}/                    # Month folders (e.g., 01_Jan, 02_Feb, ...)
 │           └── {thread_id}/              # Thread-scoped subdirectory
 │               └── {filename}            # Deduplicated by SHA-256 hash
-│                                           # Multiple emails in same thread share files
 │
 ├── db/                                  # Database directory
-│   ├── emails.db                        # Main SQLite database with sqlite-vec
-│   └── emails.db-journal               # SQLite WAL/journal (auto-generated)
+│   └── emails.db                        # Main SQLite database with sqlite-vec
 │
 ├── ingestion/                           # Ingestion pipeline artifacts
 │   ├── resume.json                      # Checkpoint file for resumable ingestion
-│   │                                     # Format: {"last_processed_path": "...", "processed_count": N, "errors": []}
-│   └── logs/                            # Ingestion logs
-│       └── ingestion_{YYYYMMDD}.log     # Rotating log files
+│   └── logs/                            # Ingestion and validation logs
+│       ├── ingestion_{YYYYMMDD}.log
+│       └── validation_{YYYYMMDD_HHMMSS}.log
 │
 ├── maildir/                             # SOURCE: User's Maildir archive (input only)
-│   ├── cur/                             # Read emails
-│   ├── new/                             # New emails
-│   └── tmp/                             # Temporary files during delivery
-│   └── .Drafts/                         # Maildir folders (example)
-│   └── .Sent/                           # Example folder structure
-│   └── .Trash/
-│   └── ...
 │
 ├── mcp_server/                          # MCP server package
 │   ├── __init__.py                      # Package init (empty)
-│   ├── server.py                        # Main MCP server entry point
-│   ├── tools.py                         # MCP tool implementations
-│   ├── database.py                      # SQLite connection and queries
-│   ├── models.py                        # Pydantic models (EmailRecord, AttachmentRecord)
+│   ├── server.py                        # Main MCP server entry point + schema validation
+│   ├── database.py                      # SQLite queries, lazy embedding model, vector search
+│   ├── models.py                        # Pydantic models (EmailRecord, AttachmentRecord, etc.)
 │   └── config.py                        # Configuration constants
 │
-├── scripts/                             # Utility scripts
-│   ├── ingest_maildir.py               # Main ingestion script
-│   ├── export_thread.py                # Export conversation to file
-│   └── rebuild_embeddings.py           # Regenerate all embeddings
+├── tests/                               # Test suite
+│   ├── run_all_validations.py           # Unified test runner
+│   ├── validate_extraction_pipeline.py  # Email extraction quality
+│   ├── validate_attachments.py          # Attachment pipeline
+│   └── validate_issue4.py               # Vector/embedding pipeline
 │
-└── tests/                               # Test suite
-    ├── __init__.py
-    ├── test_parsing.py                 # Email parsing unit tests
-    ├── test_database.py                # Database operations tests
-    ├── test_mcp_tools.py               # MCP tool integration tests
-    ├── test_threading.py               # Thread reconstruction tests
-    ├── test_attachment_dedup.py        # SHA-256 dedup tests
-    ├── fixtures/                       # Test fixtures
-    │   ├── sample_maildir/             # Small sample Maildir for testing
-    │   ├── sample.eml                  # Individual test email
-    │   └── expected_email.json         # Expected parsed output
-    └── conftest.py                     # Pytest fixtures
+├── classify_emails.py                   # Batch classification script with Gemini
+├── migrate_v2.py                        # Schema migration for v2 columns
+├── ingest.py                            # Main ingestion script
+├── run-mcp-server.py                    # MCP entry point (JSON-RPC 2.0 wrapper)
+├── run-mcp-server.sh                    # Shell script wrapper
+├── requirements.txt                     # Python dependencies
+├── AGENTS.md                            # AI assistant usage guide
+└── README.md                            # Project overview and setup guide
 ```
 
 ---
 
 ## 2. SQLite Schema
 
-### 2.1 Core Table
+### 2.1 Core Table (v2)
 
 ```sql
--- File: db/schema.sql
--- Run this during initial database setup
-
--- Enable required extensions
-LOAD EXTENSION IF NOT EXISTS vec0;
-
--- Main emails table
+-- Main emails table (v2 schema)
 CREATE TABLE IF NOT EXISTS emails (
     id TEXT PRIMARY KEY,                    -- UUIDv4, generated at ingest time
     message_id TEXT UNIQUE NOT NULL,        -- RFC 822 Message-ID, dedup key
@@ -92,7 +73,7 @@ CREATE TABLE IF NOT EXISTS emails (
     
     -- Content
     subject TEXT NOT NULL,                  -- Raw subject line
-    body_markdown TEXT NOT NULL,            -- HTML→Markdown, main body text
+    body_markdown TEXT NOT NULL,            -- HTML->Markdown, main body text
     body_plain TEXT,                        -- Plain text fallback
     x_mailer TEXT,                          -- X-Mailer/User-Agent header
     
@@ -103,7 +84,18 @@ CREATE TABLE IF NOT EXISTS emails (
     -- Storage
     folder TEXT NOT NULL,                   -- Maildir folder: "INBOX", "Sent", ".Drafts"
     raw_eml BLOB,                           -- Zstd-compressed original .eml bytes
-    embedding BLOB,                          -- sqlite-vec float32[384] vector
+    embedding BLOB,                         -- sqlite-vec float32[384] vector
+    
+    -- v2 columns (added by migrate_v2.py)
+    sender TEXT,                            -- Canonical sender address
+    recipients TEXT,                        -- All recipients as JSON array
+    body_text TEXT,                         -- Cleaned content text
+    category_tags TEXT,                     -- JSON array of category tags
+    project_tags TEXT,                      -- JSON array of project tags
+    is_outbound INTEGER,                    -- 1 if sender is user, 0 otherwise
+    parent_id TEXT,                         -- UUID of parent for salvaged replies
+    source TEXT DEFAULT 'original',         -- 'original' or 'quoted_reply'
+    content_hash TEXT,                      -- SHA-256 of normalized body
     
     -- Constraints
     CONSTRAINT message_id_not_empty CHECK (message_id <> '')
@@ -115,7 +107,8 @@ CREATE INDEX IF NOT EXISTS idx_emails_thread_id ON emails(thread_id);
 CREATE INDEX IF NOT EXISTS idx_emails_subject_thread_key ON emails(subject_thread_key);
 CREATE INDEX IF NOT EXISTS idx_emails_from_address ON emails(from_address);
 CREATE INDEX IF NOT EXISTS idx_emails_folder ON emails(folder);
-CREATE INDEX IF NOT EXISTS idx_emails_has_attachments ON emails(has_attachments);
+CREATE INDEX IF NOT EXISTS idx_emails_content_hash ON emails(content_hash);
+CREATE INDEX IF NOT EXISTS idx_emails_project_search ON emails(timestamp, sender, category_tags);
 
 -- Full-text search on subject and body
 CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
@@ -145,170 +138,234 @@ END;
 ```sql
 -- Vector search table for semantic similarity
 -- bge-small-en-v1.5 produces 384-dimensional vectors
+-- Note: ingest.py stores embeddings in both emails.embedding BLOB
+-- and email_vectors for sqlite-vec operations
 
 CREATE VIRTUAL TABLE IF NOT EXISTS email_vectors USING vec0(
     email_id TEXT,                          -- References emails.id
     embedding FLOAT[384]                    -- 384 dimensions for bge-small-en-v1.5
 );
-
--- Index for approximate nearest neighbor search
--- This creates an IVF index for faster similarity queries
-CREATE INDEX IF NOT EXISTS idx_email_vectors_ann ON email_vectors(email_id);
 ```
 
-### 2.3 Attachment Tracking Table
+### 2.3 Full-Text Search (FTS5)
+
+```sql
+-- Full-text search on subject and body
+CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
+    subject,
+    body_markdown,
+    content='emails',
+    content_rowid='rowid'
+);
+
+-- Triggers to keep FTS in sync
+CREATE TRIGGER IF NOT EXISTS emails_fts_insert AFTER INSERT ON emails BEGIN
+    INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (NEW.rowid, NEW.subject, NEW.body_markdown);
+END;
+
+CREATE TRIGGER IF NOT EXISTS emails_fts_delete AFTER DELETE ON emails BEGIN
+    INSERT INTO emails_fts(emails_fts, rowid, subject, body_markdown) VALUES('delete', OLD.rowid, OLD.subject, OLD.body_markdown);
+END;
+
+CREATE TRIGGER IF NOT EXISTS emails_fts_update AFTER UPDATE ON emails BEGIN
+    INSERT INTO emails_fts(emails_fts, rowid, subject, body_markdown) VALUES('delete', OLD.rowid, OLD.subject, OLD.body_markdown);
+    INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (NEW.rowid, NEW.subject, NEW.body_markdown);
+END;
+```
+
+### 2.4 Category & Project Tags FTS
+
+```sql
+-- FTS5 index for tag-based filtering
+CREATE VIRTUAL TABLE IF NOT EXISTS email_category_fts USING fts5(
+    category_tags,
+    project_tags,
+    content='emails'
+);
+
+-- Triggers to keep category FTS in sync
+CREATE TRIGGER IF NOT EXISTS emails_ai AFTER INSERT ON emails BEGIN
+    INSERT INTO email_category_fts(rowid, category_tags, project_tags) 
+    VALUES (new.rowid, new.category_tags, new.project_tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS emails_ad AFTER DELETE ON emails BEGIN
+    INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags) 
+    VALUES('delete', old.rowid, old.category_tags, old.project_tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS emails_au AFTER UPDATE ON emails BEGIN
+    INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags) 
+    VALUES('delete', old.rowid, old.category_tags, old.project_tags);
+    INSERT INTO email_category_fts(rowid, category_tags, project_tags) 
+    VALUES (new.rowid, new.category_tags, new.project_tags);
+END;
+```
+
+### 2.5 Attachment Tracking Table
 
 ```sql
 -- Track SHA-256 hashes for deduplication
 CREATE TABLE IF NOT EXISTS attachment_hashes (
     sha256 TEXT PRIMARY KEY,                -- SHA-256 hash of file content
-    first_email_id TEXT NOT NULL,           -- Email that first introduced this file
+    first_email_id TEXT,                    -- Email that first introduced this file
     path TEXT NOT NULL,                     -- Disk path to the stored file
     filename TEXT NOT NULL,                 -- Original filename
     mime_type TEXT,                         -- Detected MIME type
     size_bytes INTEGER NOT NULL,            -- File size
-    created_at TEXT NOT NULL,               -- ISO 8601 timestamp
-    
-    FOREIGN KEY (first_email_id) REFERENCES emails(id) ON DELETE CASCADE
+    created_at TEXT NOT NULL                -- ISO 8601 timestamp
+);
+```
+
+### 2.6 Project Registry
+
+```sql
+-- Project metadata for contextual queries
+CREATE TABLE IF NOT EXISTS project_registry (
+    name TEXT PRIMARY KEY,                  -- Project name
+    aliases TEXT,                           -- Alternative names (comma-separated)
+    summary TEXT,                           -- Project description
+    created_at TEXT                         -- ISO 8601 timestamp
+);
+```
+
+### 2.3 Full-Text Search (FTS5)
+
+```sql
+-- Full-text search on subject and body
+CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
+    subject,
+    body_markdown,
+    content='emails',
+    content_rowid='rowid'
 );
 
-CREATE INDEX IF NOT EXISTS idx_attachment_hashes_email ON attachment_hashes(first_email_id);
+-- Triggers to keep FTS in sync
+CREATE TRIGGER IF NOT EXISTS emails_fts_insert AFTER INSERT ON emails BEGIN
+    INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (NEW.rowid, NEW.subject, NEW.body_markdown);
+END;
+
+CREATE TRIGGER IF NOT EXISTS emails_fts_delete AFTER DELETE ON emails BEGIN
+    INSERT INTO emails_fts(emails_fts, rowid, subject, body_markdown) VALUES('delete', OLD.rowid, OLD.subject, OLD.body_markdown);
+END;
+
+CREATE TRIGGER IF NOT EXISTS emails_fts_update AFTER UPDATE ON emails BEGIN
+    INSERT INTO emails_fts(emails_fts, rowid, subject, body_markdown) VALUES('delete', OLD.rowid, OLD.subject, OLD.body_markdown);
+    INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (NEW.rowid, NEW.subject, NEW.body_markdown);
+END;
+```
+
+### 2.4 Category & Project Tags FTS
+
+```sql
+-- FTS5 index for tag-based filtering
+CREATE VIRTUAL TABLE IF NOT EXISTS email_category_fts USING fts5(
+    category_tags,
+    project_tags,
+    content='emails'
+);
+
+-- Triggers to keep category FTS in sync
+CREATE TRIGGER IF NOT EXISTS emails_ai AFTER INSERT ON emails BEGIN
+    INSERT INTO email_category_fts(rowid, category_tags, project_tags) 
+    VALUES (new.rowid, new.category_tags, new.project_tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS emails_ad AFTER DELETE ON emails BEGIN
+    INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags) 
+    VALUES('delete', old.rowid, old.category_tags, old.project_tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS emails_au AFTER UPDATE ON emails BEGIN
+    INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags) 
+    VALUES('delete', old.rowid, old.category_tags, old.project_tags);
+    INSERT INTO email_category_fts(rowid, category_tags, project_tags) 
+    VALUES (new.rowid, new.category_tags, new.project_tags);
+END;
+```
+
+### 2.5 Attachment Tracking Table
+
+```sql
+-- Track SHA-256 hashes for deduplication
+CREATE TABLE IF NOT EXISTS attachment_hashes (
+    sha256 TEXT PRIMARY KEY,                -- SHA-256 hash of file content
+    first_email_id TEXT,                    -- Email that first introduced this file
+    path TEXT NOT NULL,                     -- Disk path to the stored file
+    filename TEXT NOT NULL,                 -- Original filename
+    mime_type TEXT,                         -- Detected MIME type
+    size_bytes INTEGER NOT NULL,            -- File size
+    created_at TEXT NOT NULL                -- ISO 8601 timestamp
+);
+```
+
+### 2.6 Project Registry
+
+```sql
+-- Project metadata for contextual queries
+CREATE TABLE IF NOT EXISTS project_registry (
+    name TEXT PRIMARY KEY,                  -- Project name
+    aliases TEXT,                           -- Alternative names (comma-separated)
+    summary TEXT,                           -- Project description
+    created_at TEXT                         -- ISO 8601 timestamp
+);
 ```
 
 ---
 
 ## 3. Data Flow Diagram
 
+### Ingestion Pipeline
+
+```mermaid
+flowchart TB
+    A[Maildir .eml files] --> B[ingest.py]
+    B --> C[Parse Email]
+    C --> D{Duplicate?}
+    D -->|yes| E[Skip]
+    D -->|no| F[Normalize & Dedup]
+    F --> G[HTML to Markdown]
+    F --> H[SHA-256 Dedup Attachments]
+    F --> I[Generate Embedding]
+    G --> J[Compress & Store]
+    H --> J
+    I --> J
+    J --> K[(emails table)]
+    J --> L[(email_vectors)]
+    J --> M[(emails_fts)]
+    J --> N[attachments/ disk]
+    I --> O[SentenceTransformer<br/>bge-small-en-v1.5]
+    O --> I
+    J --> P[Checkpoint resume.json]
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              INGESTION PIPELINE                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
 
-    ┌──────────────┐
-    │   Maildir/   │  Source: User's 12-year Maildir archive
-    │   .eml files │  Format: RFC 822 standard format
-    └──────┬───────┘
-           │
-           ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  STEP 1: Parse Email (ingestion/parser.py)                                      │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │  • Read .eml file as bytes                                                   │ │
-│  │  • Parse with Python stdlib: mailbox.mboxMessage / email.parser              │ │
-│  │  • Handle multipart/alternative, multipart/mixed                           │ │
-│  │  • Extract: headers, body, attachments                                       │ │
-│  │  • Handle encoding errors gracefully (详见 Section 7)                        │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-           │
-           ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  STEP 2: Normalize and Deduplicate                                              │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │  • Generate UUIDv4 for id                                                    │ │
-│  │  • Check message_id uniqueness (skip if duplicate)                          │ │
-│  │  • Extract thread_id from References + In-Reply-To chain                    │ │
-│  │  • Generate subject_thread_key (strip Re:/Fwd:, lowercase)                  │ │
-│  │  • Parse from/to/cc addresses (handle display names)                        │ │
-│  │  • Normalize timestamps to ISO 8601                                          │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-           │
-           ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  STEP 3: Body Conversion (ingestion/converters.py)                              │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │  HTML → Markdown:                                                            │ │
-│  │    • beautifulsoup4: Parse HTML content                                     │ │
-│  │    • markdownify: Convert to Markdown                                        │ │
-│  │    • Handle inline images: Replace <img> with ![alt](../attachments/...)   │ │
-│  │    • Append "### 📎 Attachments" section if any attachments                 │ │
-│  │                                                                              │ │
-│  │  Plain Text Fallback:                                                       │ │
-│  │    • Use email.body if no HTML part                                         │ │
-│  │    • Strip excessive whitespace                                              │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-           │
-           ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  STEP 4: Attachment Processing (ingestion/attachments.py)                        │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │  • Extract MIME parts with Content-Disposition: attachment                   │ │
-│  │  • Generate SHA-256 hash of content                                          │ │
-│  │  • Check attachment_hashes table for existing file                           │ │
-│  │    • If exists: Reuse path, add to attachments JSON                         │ │
-│  │    • If new: Write to disk, insert hash record                              │ │
-│  │  • Store in: attachments/{YYYY}/{MM_Mon}/{thread_id}/{filename}              │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-           │
-           ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  STEP 5: Generate Embedding (ingestion/embedder.py)                             │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │  • Construct embedding string:                                              │ │
-│  │    "Subject: {subject} | From: {from_name} <{from_address}> | "             │ │
-│  │    "Date: {date_YYYY-MM-DD} | Body: {body_markdown[:1500]}"                │ │
-│  │  • Tokenize with HuggingFace tokenizer (bge-small-en-v1.5)                  │ │
-│  │  • Generate 384-dim vector with bge-small-en-v1.5 model                     │ │
-│  │  • Serialize as float32 bytes (little-endian)                              │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-           │
-           ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  STEP 6: Compress and Store (ingestion/writer.py)                                │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │  • Compress raw .eml bytes with zstd                                         │ │
-│  │  • Insert into SQLite: emails table + email_vectors table                   │ │
-│  │  • Update FTS index (via trigger)                                           │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-           │
-           ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  STEP 7: Checkpoint (ingestion/checkpoint.py)                                    │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │  • Write resume.json after each batch (500 emails)                          │ │
-│  │  • Record: last_processed_path, processed_count, errors[]                   │ │
-│  │  • On restart: Read resume.json, skip to last processed file                │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-           │
-           ▼
-    ┌──────────────┐
-    │   emails.db   │  Final: Queryable SQLite database
-    │   attachments/│  Ready for MCP server
-    └──────────────┘
+### MCP Query Path
 
-
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              MCP SERVER QUERY PATH                               │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-    ┌──────────────────┐
-    │  AI Assistant    │  Claude, OpenCode, or any MCP client
-    │  (MCP Client)    │
-    └────────┬─────────┘
-             │ MCP JSON-RPC over stdio
-             ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  MCP Server (mcp_server/server.py)                                              │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │  • stdio transport (stdio server loop)                                      │ │
-│  │  • Expose 4 tools (详见 Section 5 MCP Tools)                               │ │
-│  │  • Validate input parameters with Pydantic                                  │ │
-│  │  • Return structured JSON responses                                        │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-             │
-             ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  Database Layer (mcp_server/database.py)                                          │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │  • Connection pooling (sqlite3, single connection per request)              │ │
-│  │  • Parameterized queries (prevent SQL injection)                             │ │
-│  │  • Handle sqlite-vec similarity search                                      │ │
-│  │  • Return typed results (dict/list)                                         │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-             │
-             ▼
-    ┌──────────────┐
-    │   emails.db   │
-    └──────────────┘
+```mermaid
+flowchart LR
+    A[AI Assistant] -->|JSON-RPC 2.0 stdio| B[run-mcp-server.py]
+    B --> C[mcp_server/server.py<br/>Schema validation + Tool routing]
+    C --> D[mcp_server/database.py]
+    
+    D --> E{Query type?}
+    E -->|semantic_query| F[Lazy load embedding model]
+    F --> G[Encode query text]
+    G --> H[vec_distance_cosine<br/>ORDER BY score ASC]
+    
+    E -->|exact_keywords| I[FTS5 MATCH]
+    
+    E -->|category/project| J[Tag LIKE filter]
+    
+    E -->|metadata only| K[WHERE filters]
+    
+    H --> L[Return results]
+    I --> L
+    J --> L
+    K --> L
+    
+    D --> M[(emails.db)]
+    D --> N[(emails_fts)]
+    D --> O[(email_vectors)]
 ```
 
 ---
@@ -527,101 +584,100 @@ class SearchParams(BaseModel):
 
 ## 6. MCP Tools Specification
 
-### 6.1 search_emails
+The server exposes **2 tools** via JSON-RPC 2.0 over stdio.
+
+### 6.1 query_email_database
 
 ```python
-# Tool: search_emails
-# Purpose: Search emails using full-text, vector similarity, or metadata filters
+# Tool: query_email_database
+# Purpose: Unified email search with FTS5, vector similarity, and metadata filters
 
-async def search_emails(
-    query: str = "",                    # Search query (FTS or semantic)
-    date_from: str | None = None,       # Start date (YYYY-MM-DD or ISO 8601)
-    date_to: str | None = None,         # End date
-    from_address: str | None = None,    # Exact sender email
-    to_address: str | None = None,      # Any recipient email
-    has_attachments: bool | None = None,
-    folder: str | None = None,         # e.g., "INBOX", "Sent", ".Drafts"
-    limit: int = 20,                   # Max results (1-1000)
-    similar_to_email_id: str | None = None  # Find similar emails
-) -> list[EmailSearchResult]:
+def query_email_database(
+    semantic_query: str | None = None,     # Vector search text - generates embedding at query time
+    exact_keywords: str | None = None,     # FTS5 exact keyword match
+    category_filter: str | None = None,    # Comma-separated category tags
+    project_filter: str | None = None,     # Comma-separated project tags
+    date_from: str | None = None,          # Start date (ISO 8601)
+    date_to: str | None = None,            # End date (ISO 8601)
+    from_address: str | None = None,       # Filter by sender
+    to_address: str | None = None,         # Filter by recipient
+    is_outbound: bool | None = None,       # Filter by direction
+    has_attachments: bool | None = None,   # Filter by attachments
+    limit: int = 10,                       # Max results (1-50)
+    include_full_thread: bool = False      # Return full conversation thread
+) -> dict:
     """
-    Search emails using multiple strategies:
+    Search strategy (first match wins):
     
-    1. If similar_to_email_id provided: Use vector similarity search
-    2. If query provided: Use hybrid FTS + optional vector search
-    3. If only filters: Use metadata filters only
+    1. semantic_query provided:
+       - Generate embedding from query text using SentenceTransformer
+       - vec_distance_cosine() against all email embeddings
+       - ORDER BY score ASC (lowest distance = most similar)
+       - Returns: {"results": [...], "threads": {...}} if include_full_thread
     
-    Returns up to `limit` results sorted by relevance or timestamp.
+    2. exact_keywords provided:
+       - FTS5 MATCH query against emails_fts
+       - Apply additional metadata filters
+       - Returns: {"results": [...]}
+    
+    3. category_filter or project_filter:
+       - Tag-based LIKE filtering
+       - Apply additional metadata filters
+       - Returns: {"results": [...]}
+    
+    4. Metadata filters only:
+       - Standard WHERE clause filtering
+       - Returns: {"results": [...]}
     """
 ```
 
 **Query Flow:**
-```
-similar_to_email_id → Extract embedding from DB → Vector search (vec0) → Return similar emails
-query (no similar) → FTS5 search → Rank by BM25 → Return results
-query + vector enabled → Hybrid: FTS * 0.7 + vector * 0.3
+
+```mermaid
+flowchart TD
+    A[query_email_database] --> B{semantic_query?}
+    B -->|yes| C[Lazy load SentenceTransformer]
+    C --> D[Encode query text to float32[384]]
+    D --> E[vec_distance_cosine ORDER BY score ASC]
+    E --> F[Return ranked results]
+    
+    B -->|no| G{exact_keywords?}
+    G -->|yes| H[FTS5 MATCH query]
+    H --> F
+    
+    G -->|no| I{category or project filter?}
+    I -->|yes| J[Tag-based LIKE filter]
+    J --> F
+    
+    I -->|no| K[Metadata filters]
+    K --> F
 ```
 
-### 6.2 get_email
+### 6.2 get_project_context
 
 ```python
-# Tool: get_email
-# Purpose: Retrieve complete email by ID
+# Tool: get_project_context
+# Purpose: Get project metadata and related emails from project registry
 
-async def get_email(
-    email_id: str          # UUIDv4 of the email
-) -> EmailRecord | None:
+def get_project_context(
+    project_name: str,    # Project name or alias (required)
+    limit: int = 10       # Max emails to return (1-50)
+) -> dict | None:
     """
-    Retrieve full email record including:
-    - All headers and metadata
-    - body_markdown (use this for context)
-    - attachments list with paths
-    - raw_eml (compressed, rarely needed)
+    Returns project metadata and related emails:
     
-    Returns None if email_id not found.
-    """
-```
-
-### 6.3 get_conversation
-
-```python
-# Tool: get_conversation
-# Purpose: Retrieve all emails in a thread
-
-async def get_conversation(
-    thread_id: str         # Thread ID from References chain
-) -> ConversationThread:
-    """
-    Reconstruct full conversation thread:
-    - Fetches all emails with matching thread_id
-    - Sorts by timestamp (chronological order)
-    - Includes participant analysis
-    - Attachment inventory
+    {
+        "project": {
+            "name": "...",
+            "aliases": "...",
+            "summary": "...",
+            "created_at": "..."
+        },
+        "emails": [...]
+    }
     
-    Always use this instead of manual thread reconstruction.
-    DO NOT group by subject_thread_key for conversation view.
-    """
-```
-
-**Important:** `thread_id` comes from the email headers' References chain. Two emails with the same `thread_id` are definitively in the same conversation. Using `subject_thread_key` for thread reconstruction is unreliable and explicitly forbidden.
-
-### 6.4 find_recipient_emails
-
-```python
-# Tool: find_recipient_emails
-# Purpose: Find all emails to/from a specific email address
-
-async def find_recipient_emails(
-    email_address: str,     # Email address to search
-    limit: int = 50        # Max results (1-1000)
-) -> list[EmailSearchResult]:
-    """
-    Search for emails where:
-    - from_address matches OR
-    - Any address in to_addresses matches OR
-    - Any address in cc_addresses matches
-    
-    Useful for "Show me all emails with alice@example.com"
+    Returns None if project not found.
+    Searches project_registry by name or aliases.
     """
 ```
 

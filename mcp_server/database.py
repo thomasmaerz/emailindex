@@ -6,9 +6,26 @@ from typing import Optional
 from .config import Config
 from .models import EmailRecord, EmailSearchResult, ConversationThread, AttachmentRecord
 import zstandard as zstd
+import numpy as np
 
 
 _thread_local = threading.local()
+
+_embedding_model = None
+
+
+def _get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+        _embedding_model = SentenceTransformer(Config.EMBEDDING_MODEL)
+    return _embedding_model
+
+
+def _encode_text_to_embedding(text: str) -> bytes:
+    model = _get_embedding_model()
+    embedding = model.encode(text, convert_to_numpy=True, show_progress_bar=False)
+    return embedding.astype(np.float32).tobytes()
 
 
 def get_connection() -> sqlite3.Connection:
@@ -293,74 +310,71 @@ def query_email_database(
     params = []
     
     if semantic_query:
-        cursor.execute("SELECT embedding FROM emails WHERE embedding IS NOT NULL LIMIT 1")
-        if cursor.fetchone():
-            try:
+        try:
+            query_embedding = _encode_text_to_embedding(semantic_query)
+            
+            cursor.execute("""
+                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address,
+                       e.from_name, e.has_attachments, e.folder, e.body_markdown,
+                       vec_distance_cosine(e.embedding, ?) as score
+                FROM emails e
+                WHERE e.embedding IS NOT NULL
+                ORDER BY score ASC
+                LIMIT ?
+            """, (query_embedding, limit * 3))
+            
+            vector_results = cursor.fetchall()
+            
+            results = []
+            thread_ids = set()
+            for r in vector_results[:limit]:
+                results.append({
+                    "id": r["id"],
+                    "thread_id": r["thread_id"],
+                    "subject": r["subject"],
+                    "timestamp": r["timestamp"],
+                    "from_address": r["from_address"],
+                    "from_name": r["from_name"],
+                    "snippet": r["body_markdown"][:500] if r["body_markdown"] else "",
+                    "score": r["score"],
+                    "has_attachments": bool(r["has_attachments"]),
+                    "folder": r["folder"]
+                })
+                if r["thread_id"]:
+                    thread_ids.add(r["thread_id"])
+            
+            if include_full_thread and thread_ids:
                 cursor.execute("""
                     SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address,
-                           e.from_name, e.has_attachments, e.folder, e.body_markdown,
-                           vec_distance_cosine(e.embedding, (
-                               SELECT embedding FROM emails WHERE id = (
-                                   SELECT id FROM emails WHERE embedding IS NOT NULL LIMIT 1
-                               )
-                           )) as score
+                           e.from_name, e.has_attachments, e.folder, e.body_markdown
                     FROM emails e
-                    WHERE e.embedding IS NOT NULL
-                    ORDER BY score DESC
-                    LIMIT ?
-                """, (limit * 3,))
+                    WHERE e.thread_id IN ({})
+                    ORDER BY e.timestamp ASC
+                """.format(",".join(["?"] * len(thread_ids))), list(thread_ids))
                 
-                vector_results = cursor.fetchall()
-                
-                results = []
-                thread_ids = set()
-                for r in vector_results[:limit]:
-                    results.append({
-                        "id": r["id"],
-                        "thread_id": r["thread_id"],
-                        "subject": r["subject"],
-                        "timestamp": r["timestamp"],
-                        "from_address": r["from_address"],
-                        "from_name": r["from_name"],
-                        "snippet": r["body_markdown"][:500] if r["body_markdown"] else "",
-                        "score": r["score"],
-                        "has_attachments": bool(r["has_attachments"]),
-                        "folder": r["folder"]
+                thread_emails = cursor.fetchall()
+                threads = {}
+                for te in thread_emails:
+                    tid = te["thread_id"]
+                    if tid not in threads:
+                        threads[tid] = []
+                    threads[tid].append({
+                        "id": te["id"],
+                        "subject": te["subject"],
+                        "timestamp": te["timestamp"],
+                        "from_address": te["from_address"],
+                        "from_name": te["from_name"],
+                        "snippet": te["body_markdown"][:500] if te["body_markdown"] else "",
                     })
-                    if r["thread_id"]:
-                        thread_ids.add(r["thread_id"])
-                
-                if include_full_thread and thread_ids:
-                    cursor.execute("""
-                        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address,
-                               e.from_name, e.has_attachments, e.folder, e.body_markdown
-                        FROM emails e
-                        WHERE e.thread_id IN ({})
-                        ORDER BY e.timestamp ASC
-                    """.format(",".join(["?"] * len(thread_ids))), list(thread_ids))
-                    
-                    thread_emails = cursor.fetchall()
-                    threads = {}
-                    for te in thread_emails:
-                        tid = te["thread_id"]
-                        if tid not in threads:
-                            threads[tid] = []
-                        threads[tid].append({
-                            "id": te["id"],
-                            "subject": te["subject"],
-                            "timestamp": te["timestamp"],
-                            "from_address": te["from_address"],
-                            "from_name": te["from_name"],
-                            "snippet": te["body_markdown"][:500] if te["body_markdown"] else "",
-                        })
-                    
-                    close_connection()
-                    return {"results": results, "threads": threads}
                 
                 close_connection()
-                return {"results": results}
-            except Exception:
-                pass
+                return {"results": results, "threads": threads}
+            
+            close_connection()
+            return {"results": results}
+        except Exception as e:
+            close_connection()
+            raise ValueError(f"Vector search failed: {e}")
     
     if exact_keywords:
         safe_query = exact_keywords.strip()
@@ -379,8 +393,7 @@ def query_email_database(
             tag_conditions = " OR ".join(["category_tags LIKE ?" for _ in tags])
             tag_conditions += " OR " + " OR ".join(["project_tags LIKE ?" for _ in tags])
             where_clauses.append(f"({tag_conditions})")
-            for _ in tags:
-                params.extend([f"%{t}%" for t in tags])
+            params.extend([f"%{t}%" for t in tags])
     
     if date_from:
         where_clauses.append("e.timestamp >= ?")

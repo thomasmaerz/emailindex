@@ -8,6 +8,7 @@ Exposes email search and retrieval tools via Model Context Protocol.
 import sys
 import json
 from pathlib import Path
+import sqlite3
 
 from .models import (
     EmailRecord, EmailSearchResult, ConversationThread,
@@ -21,10 +22,30 @@ from .config import Config
 class MCPServer:
     def __init__(self):
         Config.ensure_directories()
+        self._verify_schema()
         self.tools = {
             "query_email_database": self.tool_query_email_database,
             "get_project_context": self.tool_get_project_context,
         }
+    
+    def _verify_schema(self):
+        """Verify database has required schema. Auto-migrate if needed, or fail fast."""
+        conn = sqlite3.connect(str(Config.DB_PATH))
+        cursor = conn.cursor()
+        
+        cursor.execute("PRAGMA table_info(emails)")
+        columns = {row[1] for row in cursor.fetchall()}
+        
+        required_v2_cols = {'sender', 'recipients', 'body_text', 'category_tags', 'project_tags', 'is_outbound'}
+        missing = required_v2_cols - columns
+        
+        if missing:
+            conn.close()
+            print(f"ERROR: Missing required v2 columns: {missing}", file=sys.stderr)
+            print("Run: python migrate_v2.py", file=sys.stderr)
+            sys.exit(1)
+        
+        conn.close()
     
     def tool_query_email_database(self, params: dict) -> dict:
         try:
