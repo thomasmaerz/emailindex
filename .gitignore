@@ -158,3 +158,6 @@ ingestion/logs/
 attachments/
 maildir/
 .worktrees/
+
+# Track AGENTS.md (override global ignore)
+!AGENTS.md
