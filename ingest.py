@@ -337,6 +337,53 @@ def _compute_content_hash(text: str) -> str:
     return hashlib.sha256(_normalize_for_hash(text).encode()).hexdigest()
 
 
+def _extract_text_from_html(html_text: str) -> str:
+    """Extract text content from raw HTML while preserving structure for quote detection."""
+    if not html_text or not html_text.strip():
+        return ''
+    
+    soup = BeautifulSoup(html_text, 'html.parser')
+    
+    for element in soup(['script', 'style']):
+        element.decompose()
+    
+    text = soup.get_text(separator='\n', strip=True)
+    
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    
+    cleaned_lines = []
+    header_labels = ('From', 'Sent', 'To', 'Cc', 'Subject', 'Bcc', 'Reply-To', 'Date')
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.endswith(':') and line.rsplit(':', 1)[0] in header_labels:
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                if not next_line.endswith(':') and not any(next_line.startswith(h + ':') for h in header_labels):
+                    merged = line + ' ' + next_line
+                    cleaned_lines.append(merged)
+                    i += 2
+                    continue
+        cleaned_lines.append(line)
+        i += 1
+    
+    text_with_quote_start = []
+    prev_was_header = False
+    for idx, line in enumerate(cleaned_lines):
+        is_header = line.startswith('From:') or line.startswith('Sent:') or line.startswith('To:') or line.startswith('Subject:')
+        if line.startswith('From:') and idx > 0 and not prev_was_header:
+            text_with_quote_start.append('')
+        text_with_quote_start.append(line)
+        prev_was_header = is_header
+    
+    text = '\n'.join(text_with_quote_start)
+    
+    text = re.sub(r'(Subject:[^\n]+)\n([^\n])', r'\1\n\n\2', text)
+    
+    return text
+
+
 _OUTLOOK_QUOTE_PATTERNS = [
     re.compile(
         r'(?:^|\n\n)(From:[^\n]+\n'
@@ -456,22 +503,29 @@ def _make_salvaged_record(content: str, content_hash: str, parent_record: dict) 
     }
 
 
-def salvage_quotes(plain_text: str, parent_record: dict, conn: sqlite3.Connection) -> list[dict]:
-    """Extract quoted fragments, deduplicate (Tier 1 + Tier 2), return salvaged records."""
-    if not plain_text or not plain_text.strip():
+def salvage_quotes(plain_text: Optional[str] = None, html_text: Optional[str] = None, parent_record: Optional[dict] = None, conn: Optional[sqlite3.Connection] = None) -> list[dict]:
+    """Extract quoted fragments from plain text or HTML, deduplicate (Tier 1 + Tier 2), return salvaged records."""
+    # Prefer plain text if available
+    text_to_process = None
+    if plain_text and plain_text.strip():
+        text_to_process = plain_text
+    elif html_text and html_text.strip():
+        text_to_process = _extract_text_from_html(html_text)
+    
+    if not text_to_process or not text_to_process.strip():
         return []
     
     salvaged = []
     
     quoted_fragments = []
     try:
-        fragments = EmailReplyParser.read(plain_text)
+        fragments = EmailReplyParser.read(text_to_process)
         quoted_fragments = [f for f in fragments.fragments if f.quoted]
     except Exception as e:
         logger.warning(f"Failed to parse email for quotes: {e}")
     
     if not quoted_fragments:
-        outlook_quotes = _extract_outlook_quotes(plain_text)
+        outlook_quotes = _extract_outlook_quotes(text_to_process)
         for content in outlook_quotes:
             content_hash = _compute_content_hash(content)
             if _is_duplicate_by_hash(conn, content_hash):
@@ -783,7 +837,7 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
         # Extract quoted fragments BEFORE markdown conversion
         salvaged_records = []
         if plain_body and db_conn:
-            salvaged_records = salvage_quotes(plain_body, parent_record, db_conn)
+            salvaged_records = salvage_quotes(plain_text=plain_body, parent_record=parent_record, conn=db_conn)
         
         # Convert HTML to markdown (original body stays intact with quotes)
         if html_body:
