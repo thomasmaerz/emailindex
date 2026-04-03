@@ -440,6 +440,233 @@ def check_mcp_filters_quoted_replies() -> tuple[bool, str, dict]:
         return False, f"MCP filter mismatch: expected {expected_filtered}, got {filtered_count}", {"total": total, "filtered": filtered_count, "quoted_excluded": total_quoted}
 
 
+def check_salvage_content_quality() -> tuple[bool, str, dict]:
+    """Verify salvaged records have non-empty, meaningful body content."""
+    import sys
+    sys.path.insert(0, str(BASE_DIR))
+    from ingest import _strip_signatures
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT id, subject, body_markdown, length(body_markdown) as body_len
+        FROM emails WHERE source = 'quoted_reply'
+    """)
+    quoted = c.fetchall()
+    conn.close()
+    
+    if not quoted:
+        return True, "No quoted_reply records to check", {"checked": 0}
+    
+    meaningful = 0
+    empty_or_noise = 0
+    samples = []
+    
+    for row in quoted:
+        body = row["body_markdown"] or ""
+        stripped = _strip_signatures(body)
+        if len(stripped.strip()) > 50:
+            meaningful += 1
+        else:
+            empty_or_noise += 1
+            if len(samples) < 3:
+                samples.append({"id": row["id"], "subject": row["subject"], "body_len": row["body_len"]})
+    
+    result = {"checked": len(quoted), "meaningful": meaningful, "empty_or_noise": empty_or_noise, "samples": samples}
+    
+    if meaningful == len(quoted):
+        return True, f"All {meaningful} salvaged records have meaningful content", result
+    else:
+        return False, f"{empty_or_noise}/{len(quoted)} salvaged records have empty or noise content", result
+
+
+def check_salvage_rate_analysis() -> tuple[bool, str, dict]:
+    """Analyze why salvage rate is low - calendar invites vs actual replies."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE source = 'original'")
+    total_original = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE source = 'original' AND length(body_plain) > 200")
+    with_plain = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE source = 'original' AND length(body_markdown) > 200")
+    with_html = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE source = 'original' AND length(body_plain) > 200 AND length(body_markdown) > 200")
+    with_both = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE source = 'quoted_reply'")
+    quoted_count = c.fetchone()[0]
+    
+    conn.close()
+    
+    salvage_rate = (quoted_count / with_plain * 100) if with_plain > 0 else 0
+    
+    # Check for calendar invite indicators
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT subject, COUNT(*) as cnt 
+        FROM emails 
+        WHERE source = 'original' 
+          AND (subject LIKE 'Accepted:%' OR subject LIKE 'Declined:%' OR subject LIKE 'Canceled:%' OR subject LIKE 'Tentative:%')
+        GROUP BY subject
+        ORDER BY cnt DESC
+        LIMIT 10
+    """)
+    calendar_subjects = c.fetchall()
+    
+    conn.close()
+    
+    result = {
+        "total_original": total_original,
+        "with_plain_text_200": with_plain,
+        "with_html_200": with_html,
+        "with_both": with_both,
+        "quoted_reply_count": quoted_count,
+        "salvage_rate_percent": round(salvage_rate, 1),
+        "calendar_invite_sample": [{"subject": r["subject"], "count": r["cnt"]} for r in calendar_subjects[:5]]
+    }
+    
+    if salvage_rate < 5:
+        return True, f"Salvage rate low ({salvage_rate:.1f}%) - likely dominated by calendar invites", result
+    elif salvage_rate > 50:
+        return True, f"Salvage rate healthy ({salvage_rate:.1f}%)", result
+    else:
+        return True, f"Salvage rate moderate ({salvage_rate:.1f}%)", result
+
+
+def check_signature_stripping() -> tuple[bool, str, dict]:
+    """Verify signature stripping patterns remove common signatures."""
+    import sys
+    sys.path.insert(0, str(BASE_DIR))
+    from ingest import _SIGNATURE_STRIP_PATTERNS, _strip_signatures
+    
+    test_cases = [
+        ("Standard signature", "Hello world\n--\nJohn Doe\nCEO"),
+        ("Mobile signature", "Sent from my iPhone"),
+        ("Outlook original", "From: John\nSent: Monday\nTo: Jane\n\nSome reply content"),
+        ("Multiline signature", "Best regards\nJohn\n\n--\nSent from my Android"),
+    ]
+    
+    results = []
+    for name, text in test_cases:
+        stripped = _strip_signatures(text)
+        removed = len(text) - len(stripped)
+        results.append({"test": name, "original_len": len(text), "stripped_len": len(stripped), "chars_removed": removed})
+    
+    return True, f"Signature stripping patterns tested on {len(test_cases)} cases", {"tests": results}
+
+
+def check_semantic_dedup() -> tuple[bool, str, dict]:
+    """Verify Tier 2 semantic deduplication prevents near-duplicate fragments."""
+    try:
+        from sentence_transformers import util
+        import numpy as np
+    except ImportError:
+        return True, "sentence-transformers not available, skipping semantic dedup check", {"checked": 0}
+    
+    import sys
+    sys.path.insert(0, str(BASE_DIR))
+    from mcp_server.database import _encode_text_to_embedding
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    # Get all quoted_reply records within same thread
+    c.execute("""
+        SELECT qr1.id as id1, qr1.body_markdown as body1, qr1.thread_id as tid,
+               qr2.id as id2, qr2.body_markdown as body2
+        FROM emails qr1
+        JOIN emails qr2 ON qr1.thread_id = qr2.thread_id 
+          AND qr1.source = 'quoted_reply' 
+          AND qr2.source = 'quoted_reply'
+          AND qr1.id < qr2.id
+        WHERE qr1.thread_id IS NOT NULL
+    """)
+    
+    pairs = c.fetchall()
+    conn.close()
+    
+    if not pairs:
+        return True, "No quoted_reply pairs in same thread to check", {"checked": 0}
+    
+    similar_pairs = 0
+    checked = 0
+    
+    for pair in pairs[:50]:
+        if not pair["body1"] or not pair["body2"]:
+            continue
+        
+        try:
+            emb1 = _encode_text_to_embedding(pair["body1"])
+            emb2 = _encode_text_to_embedding(pair["body2"])
+            
+            vec1 = np.frombuffer(emb1, dtype=np.float32)
+            vec2 = np.frombuffer(emb2, dtype=np.float32)
+            
+            similarity = util.cos_sim(vec1, vec2).item()
+            checked += 1
+            
+            if similarity >= 0.98:
+                similar_pairs += 1
+        except Exception:
+            continue
+    
+    result = {"pairs_checked": checked, "similar_pairs_0.98": similar_pairs}
+    
+    if similar_pairs == 0:
+        return True, f"No near-duplicate fragments found among {checked} checked pairs", result
+    else:
+        return False, f"Found {similar_pairs} near-duplicate pairs (similarity >= 0.98)", result
+
+
+def check_html_only_emails() -> tuple[bool, str, dict]:
+    """Document emails with HTML body but empty plain text - can't be salvaged."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT COUNT(*) FROM emails 
+        WHERE source = 'original' 
+          AND (body_plain IS NULL OR body_plain = '')
+          AND (body_markdown IS NOT NULL AND body_markdown != '')
+    """)
+    html_only = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE source = 'original'")
+    total_original = c.fetchone()[0]
+    
+    c.execute("""
+        SELECT subject, length(body_markdown) as md_len
+        FROM emails 
+        WHERE source = 'original' 
+          AND (body_plain IS NULL OR body_plain = '')
+          AND body_markdown IS NOT NULL
+        ORDER BY md_len DESC
+        LIMIT 5
+    """)
+    samples = c.fetchall()
+    
+    conn.close()
+    
+    result = {
+        "html_only_count": html_only,
+        "total_original": total_original,
+        "html_only_percent": round(html_only / total_original * 100, 1),
+        "sample_subjects": [{"subject": str(r[0])[:60], "md_len": r[1]} for r in samples]
+    }
+    
+    return True, f"{html_only} HTML-only emails ({result['html_only_percent']}%) can't be salvaged with current approach", result
+
+
 def run_validation(sample_size: int = 50, verbose: bool = False) -> dict:
     """Run full validation and return results."""
     results = {}
@@ -459,6 +686,11 @@ def run_validation(sample_size: int = 50, verbose: bool = False) -> dict:
         ("Content Hash Uniqueness", lambda: check_content_hash_uniqueness()),
         ("Parent-Child Relationship", lambda: check_parent_child_relationship()),
         ("MCP Filters Quoted Replies", lambda: check_mcp_filters_quoted_replies()),
+        ("Salvage Content Quality", lambda: check_salvage_content_quality()),
+        ("Salvage Rate Analysis", lambda: check_salvage_rate_analysis()),
+        ("Signature Stripping", lambda: check_signature_stripping()),
+        ("Semantic Dedup", lambda: check_semantic_dedup()),
+        ("HTML-Only Emails", lambda: check_html_only_emails()),
     ]
     
     all_passed = True

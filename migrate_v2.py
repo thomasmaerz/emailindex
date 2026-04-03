@@ -48,7 +48,7 @@ def migrate():
         UPDATE emails 
         SET sender = from_address,
             body_text = body_markdown,
-            source = 'original'
+            source = COALESCE(source, 'original')
         WHERE sender IS NULL
     """)
     print(f"Migrated {cursor.rowcount} rows")

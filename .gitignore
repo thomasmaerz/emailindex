@@ -150,8 +150,8 @@ cython_debug/
 .idea/
 
 # emailindex specific
-db/emails.db
-db/emails.db-journal
+db/
+!.gitkeep
 ingestion/resume.json
 ingestion/resume_classification.json
 ingestion/logs/
