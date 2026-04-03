@@ -9,3 +9,4 @@ python-dateutil>=2.8.0
 uuid>=1.30
 email-reply-parser>=0.5.12
 google-genai>=0.3.0
+pytest>=7.0.0

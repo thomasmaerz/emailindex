@@ -326,6 +326,120 @@ def check_no_raw_html_in_body() -> tuple[bool, str, dict]:
         return False, f"{raw_html} emails may have raw HTML in body", result
 
 
+def check_salvage_quotes() -> tuple[bool, str, dict]:
+    """Verify quoted_reply records exist with valid parent_id and content_hash."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE source = 'quoted_reply'")
+    quoted_count = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE source = 'original'")
+    original_count = c.fetchone()[0]
+    
+    if quoted_count == 0:
+        conn.close()
+        return False, "No quoted_reply records found. Quote salvage pipeline may not be working.", {"quoted": 0, "original": original_count}
+    
+    c.execute("""
+        SELECT COUNT(*) FROM emails 
+        WHERE source = 'quoted_reply' 
+          AND parent_id IS NOT NULL 
+          AND content_hash IS NOT NULL
+    """)
+    valid_quoted = c.fetchone()[0]
+    
+    conn.close()
+    
+    result = {"quoted_reply": quoted_count, "valid": valid_quoted, "original": original_count}
+    
+    if valid_quoted == quoted_count:
+        return True, f"All {quoted_count} quoted_reply records have valid parent_id and content_hash", result
+    else:
+        return False, f"Only {valid_quoted}/{quoted_count} quoted_reply have parent_id and content_hash", result
+
+
+def check_content_hash_uniqueness() -> tuple[bool, str, dict]:
+    """Verify no duplicate content_hash values in quoted_reply records."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT content_hash, COUNT(*) as cnt 
+        FROM emails 
+        WHERE source = 'quoted_reply' AND content_hash IS NOT NULL
+        GROUP BY content_hash 
+        HAVING cnt > 1
+    """)
+    duplicates = c.fetchall()
+    
+    conn.close()
+    
+    if not duplicates:
+        return True, "No duplicate content_hash values in quoted_reply records", {"duplicates": 0}
+    
+    return False, f"Found {len(duplicates)} duplicate content_hash values", {"duplicates": len(duplicates), "samples": [d[0] for d in duplicates[:5]]}
+
+
+def check_parent_child_relationship() -> tuple[bool, str, dict]:
+    """Verify all parent_id values reference valid emails."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT id FROM emails WHERE source = 'quoted_reply'")
+    quoted_ids = [row[0] for row in c.fetchall()]
+    
+    if not quoted_ids:
+        conn.close()
+        return True, "No quoted_reply records to check", {"checked": 0, "valid": 0}
+    
+    valid = 0
+    invalid = 0
+    
+    for qid in quoted_ids[:100]:
+        c.execute("SELECT parent_id FROM emails WHERE id = ?", (qid,))
+        row = c.fetchone()
+        if row and row[0]:
+            c.execute("SELECT 1 FROM emails WHERE id = ?", (row[0],))
+            if c.fetchone():
+                valid += 1
+            else:
+                invalid += 1
+    
+    conn.close()
+    
+    result = {"checked": len(quoted_ids[:100]), "valid": valid, "invalid": invalid}
+    
+    if invalid == 0:
+        return True, f"All {valid} parent_id references are valid", result
+    else:
+        return False, f"Found {invalid} invalid parent_id references", result
+
+
+def check_mcp_filters_quoted_replies() -> tuple[bool, str, dict]:
+    """Verify MCP queries exclude quoted_reply by default."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE source = 'quoted_reply'")
+    total_quoted = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM emails WHERE (source IS NULL OR source != 'quoted_reply')")
+    filtered_count = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM emails")
+    total = c.fetchone()[0]
+    
+    conn.close()
+    
+    expected_filtered = total - total_quoted
+    
+    if filtered_count == expected_filtered:
+        return True, f"MCP filter excludes quoted_reply: {filtered_count} records returned", {"total": total, "filtered": filtered_count, "quoted_excluded": total_quoted}
+    else:
+        return False, f"MCP filter mismatch: expected {expected_filtered}, got {filtered_count}", {"total": total, "filtered": filtered_count, "quoted_excluded": total_quoted}
+
+
 def run_validation(sample_size: int = 50, verbose: bool = False) -> dict:
     """Run full validation and return results."""
     results = {}
@@ -341,6 +455,10 @@ def run_validation(sample_size: int = 50, verbose: bool = False) -> dict:
         ("Vector Coverage", lambda: check_vector_coverage()),
         ("has_attachments Accuracy", lambda: check_has_attachments_accuracy(sample_size)),
         ("No Raw HTML in Body", lambda: check_no_raw_html_in_body()),
+        ("Salvage Quotes", lambda: check_salvage_quotes()),
+        ("Content Hash Uniqueness", lambda: check_content_hash_uniqueness()),
+        ("Parent-Child Relationship", lambda: check_parent_child_relationship()),
+        ("MCP Filters Quoted Replies", lambda: check_mcp_filters_quoted_replies()),
     ]
     
     all_passed = True

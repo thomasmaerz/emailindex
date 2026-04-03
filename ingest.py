@@ -26,6 +26,7 @@ from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 import zstandard as zstd
 from sentence_transformers import SentenceTransformer
+from email_reply_parser import EmailReplyParser
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "db" / "emails.db"
@@ -35,10 +36,10 @@ LOG_DIR = BASE_DIR / "ingestion" / "logs"
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_DIMENSIONS = 384
-EMBEDDING_BATCH_SIZE = 16
+EMBEDDING_BATCH_SIZE = 8
 CHECKPOINT_INTERVAL = 500
 ZSTD_COMPRESSION_LEVEL = 3
-MAX_EMAILS = 1000
+MAX_EMAILS = 999999
 
 logging.basicConfig(
     level=logging.INFO,
@@ -295,6 +296,208 @@ def compress_eml(raw_bytes: bytes) -> bytes:
     return compressor.compress(raw_bytes)
 
 
+# === Quote Salvage Functions ===
+
+_SIGNATURE_STRIP_PATTERNS = [
+    # Mobile & App
+    r'(?i)Sent from my (iPhone|Android|Galaxy|iPad|handheld).*',
+    r'(?i)Get (Outlook|Mail) for (iOS|Android|Mobile).*',
+    r'(?i)Sent from Gmail.*',
+    # Visual Separators
+    r'^--\s*$',
+    r'^[_\-=]{10,}$',
+    r'^(\*\*\*+|###+)$',
+    # Professional Headers
+    r'(?i)Original Message',
+    r'(?i)From:.*?Sent:.*?To:.*?(?:Subject:.*?)(?=\n|$)',
+    r'(?i)IMPORTANT:.*',
+    r'(?i)Please consider the environment before printing.*',
+    # Hanging reply headers
+    r'^On\s.*\swrote:$',
+]
+
+
+def _strip_signatures(text: str) -> str:
+    """Remove signature noise from text fragment."""
+    for pattern in _SIGNATURE_STRIP_PATTERNS:
+        text = re.sub(pattern, '', text, flags=re.MULTILINE)
+    return text
+
+
+def _normalize_for_hash(text: str) -> str:
+    """Tier 1: Normalize text for hash comparison."""
+    text = _strip_signatures(text)
+    text = text.lower()
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^a-z0-9]', '', text)
+    return text
+
+
+def _compute_content_hash(text: str) -> str:
+    return hashlib.sha256(_normalize_for_hash(text).encode()).hexdigest()
+
+
+_OUTLOOK_QUOTE_PATTERNS = [
+    re.compile(
+        r'(?:^|\n\n)(From:[^\n]+\n'
+        r'Sent:[^\n]+\n'
+        r'To:[^\n]+\n'
+        r'(?:Cc:[^\n]+\n)?'
+        r'Subject:[^\n]+\n'
+        r'\n'
+        r'.+?)(?=\n{2}From:[^\n]+\n|$)',
+        re.MULTILINE | re.DOTALL
+    ),
+    re.compile(
+        r'(?:^|\n\n)(----- ?Original Message ?-----\n'
+        r'.+)',
+        re.MULTILINE | re.DOTALL
+    ),
+    re.compile(
+        r'(?:^|\n\n)(On\s[^\n]+?wrote:\n'
+        r'.+)',
+        re.MULTILINE | re.DOTALL
+    ),
+]
+
+
+def _extract_outlook_quotes(text: str) -> list[str]:
+    """Extract quoted reply blocks from Outlook-style emails."""
+    quotes = []
+    for pattern in _OUTLOOK_QUOTE_PATTERNS:
+        matches = pattern.findall(text)
+        for match in matches:
+            cleaned = match.strip()
+            if len(cleaned) > 100:
+                quotes.append(cleaned)
+    return quotes
+
+
+def _is_duplicate_by_hash(conn: sqlite3.Connection, content_hash: str) -> bool:
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM emails WHERE content_hash = ?", (content_hash,))
+    return cursor.fetchone() is not None
+
+
+_EMBEDDING_MODEL = None
+
+
+def _get_embedding_model():
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is None:
+        _EMBEDDING_MODEL = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    return _EMBEDDING_MODEL
+
+
+def _encode_text_to_embedding(text: str) -> bytes:
+    import numpy as np
+    model = _get_embedding_model()
+    embedding = model.encode(text, convert_to_numpy=True, show_progress_bar=False)
+    return embedding.astype(np.float32).tobytes()
+
+
+def _is_duplicate_by_similarity(conn: sqlite3.Connection, fragment_text: str, thread_id: Optional[str]) -> bool:
+    """Tier 2: Check semantic similarity within thread."""
+    if not thread_id:
+        return False
+    
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT embedding FROM emails 
+        WHERE thread_id = ? AND embedding IS NOT NULL
+    """, (thread_id,))
+    
+    rows = cursor.fetchall()
+    if not rows:
+        return False
+    
+    from sentence_transformers import util
+    import numpy as np
+    
+    try:
+        fragment_embedding = _encode_text_to_embedding(fragment_text)
+        fragment_vec = np.frombuffer(fragment_embedding, dtype=np.float32)
+        
+        for row in rows:
+            existing_vec = np.frombuffer(row['embedding'], dtype=np.float32)
+            similarity = util.cos_sim(fragment_vec, existing_vec).item()
+            if similarity >= 0.98:
+                return True
+    except Exception:
+        pass
+    
+    return False
+
+
+def _make_salvaged_record(content: str, content_hash: str, parent_record: dict) -> dict:
+    """Create a salvaged quoted_reply record."""
+    return {
+        'id': str(uuid.uuid4()),
+        'message_id': f"salvaged-{uuid.uuid4()}@emailindex.local",
+        'thread_id': parent_record['thread_id'],
+        'parent_id': parent_record['id'],
+        'source': 'quoted_reply',
+        'content_hash': content_hash,
+        'subject_thread_key': parent_record['subject_thread_key'],
+        'timestamp': parent_record['timestamp'],
+        'from_address': parent_record['from_address'],
+        'from_name': parent_record['from_name'],
+        'to_addresses': parent_record['to_addresses'],
+        'cc_addresses': parent_record['cc_addresses'],
+        'subject': f"[Salvaged] {parent_record['subject']}",
+        'body_markdown': content,
+        'body_plain': content,
+        'x_mailer': None,
+        'has_attachments': 0,
+        'attachments': '[]',
+        'folder': parent_record['folder'],
+        'raw_eml': None,
+        'embedding': None,
+    }
+
+
+def salvage_quotes(plain_text: str, parent_record: dict, conn: sqlite3.Connection) -> list[dict]:
+    """Extract quoted fragments, deduplicate (Tier 1 + Tier 2), return salvaged records."""
+    if not plain_text or not plain_text.strip():
+        return []
+    
+    salvaged = []
+    
+    quoted_fragments = []
+    try:
+        fragments = EmailReplyParser.read(plain_text)
+        quoted_fragments = [f for f in fragments.fragments if f.quoted]
+    except Exception as e:
+        logger.warning(f"Failed to parse email for quotes: {e}")
+    
+    if not quoted_fragments:
+        outlook_quotes = _extract_outlook_quotes(plain_text)
+        for content in outlook_quotes:
+            content_hash = _compute_content_hash(content)
+            if _is_duplicate_by_hash(conn, content_hash):
+                continue
+            if _is_duplicate_by_similarity(conn, content, parent_record.get('thread_id')):
+                continue
+            salvaged.append(_make_salvaged_record(content, content_hash, parent_record))
+    
+    for fragment in quoted_fragments:
+        content = fragment.content.strip()
+        if len(content) < 100:
+            continue
+        
+        content_hash = _compute_content_hash(content)
+        
+        if _is_duplicate_by_hash(conn, content_hash):
+            continue
+        
+        if _is_duplicate_by_similarity(conn, content, parent_record.get('thread_id')):
+            continue
+        
+        salvaged.append(_make_salvaged_record(content, content_hash, parent_record))
+    
+    return salvaged
+
+
 def init_database(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -328,7 +531,10 @@ def init_database(db_path: Path):
             attachments TEXT,
             folder TEXT NOT NULL,
             raw_eml BLOB,
-            embedding BLOB
+            embedding BLOB,
+            source TEXT DEFAULT 'original',
+            parent_id TEXT,
+            content_hash TEXT
         )
     """)
     
@@ -521,7 +727,8 @@ def process_attachments(message: Message, email_id: str, thread_id: Optional[str
     return attachments
 
 
-def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sqlite3.Connection] = None, source_path: Optional[str] = None) -> Optional[dict]:
+def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sqlite3.Connection] = None, source_path: Optional[str] = None) -> list[dict]:
+    """Parse email file and extract quoted fragments. Returns list of records (original + salvaged)."""
     try:
         with open(eml_path, 'rb') as f:
             raw_bytes = f.read()
@@ -542,19 +749,13 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
         
         html_body, plain_body = EncodingHandler.get_message_body(message)
         
-        if html_body:
-            body_markdown = Converter.html_to_markdown(html_body)
-        else:
-            body_markdown = plain_body or ""
-        
-        body_markdown = body_markdown.strip()
-        
         email_id = str(uuid.uuid4())
         
+        # Build parent record first so we can pass to salvage_quotes
         attachments = process_attachments(message, email_id, thread_id, timestamp, db_conn)
         has_attachments = len(attachments) > 0
         
-        return {
+        parent_record = {
             'id': email_id,
             'message_id': message_id,
             'thread_id': thread_id,
@@ -565,20 +766,38 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
             'to_addresses': json.dumps(to_addresses),
             'cc_addresses': json.dumps(cc_addresses) if cc_addresses else None,
             'subject': subject,
-            'body_markdown': body_markdown,
-            'body_plain': plain_body or None,
+            'body_markdown': '',
+            'body_plain': plain_body,
             'x_mailer': x_mailer,
             'has_attachments': 1 if has_attachments else 0,
             'attachments': json.dumps(attachments),
             'folder': folder,
             'raw_eml': compress_eml(raw_bytes),
             'embedding': None,
-            'source_path': source_path or str(eml_path)
+            'source_path': source_path or str(eml_path),
+            'source': 'original',
+            'parent_id': None,
+            'content_hash': None,
         }
+        
+        # Extract quoted fragments BEFORE markdown conversion
+        salvaged_records = []
+        if plain_body and db_conn:
+            salvaged_records = salvage_quotes(plain_body, parent_record, db_conn)
+        
+        # Convert HTML to markdown (original body stays intact with quotes)
+        if html_body:
+            body_markdown = Converter.html_to_markdown(html_body)
+        else:
+            body_markdown = plain_body or ""
+        
+        parent_record['body_markdown'] = body_markdown.strip()
+        
+        return [parent_record] + salvaged_records
     
     except Exception as e:
         logger.error(f"Error parsing {eml_path}: {e}")
-        return None
+        return []
 
 
 def generate_embedding_text(record: dict) -> str:
@@ -640,14 +859,18 @@ def insert_email(conn: sqlite3.Connection, record: dict):
     cursor = conn.cursor()
     
     embedding_blob = record.get('embedding')
+    source = record.get('source', 'original')
+    parent_id = record.get('parent_id')
+    content_hash = record.get('content_hash')
     
     cursor.execute("""
         INSERT INTO emails (
             id, message_id, thread_id, subject_thread_key, timestamp,
             from_address, from_name, to_addresses, cc_addresses,
             subject, body_markdown, body_plain, x_mailer,
-            has_attachments, attachments, folder, raw_eml, embedding
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            has_attachments, attachments, folder, raw_eml, embedding,
+            source, parent_id, content_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         record['id'],
         record['message_id'],
@@ -666,7 +889,10 @@ def insert_email(conn: sqlite3.Connection, record: dict):
         record['attachments'],
         record['folder'],
         record['raw_eml'],
-        embedding_blob
+        embedding_blob,
+        source,
+        parent_id,
+        content_hash
     ))
     
     if embedding_blob:
@@ -715,8 +941,8 @@ def ingest_emails(maildir_path: Path, resume: bool = True):
     
     for idx, (eml_path, folder) in enumerate(email_files):
         try:
-            record = parse_email_file(eml_path, folder, conn, source_path=str(eml_path))
-            if record is None:
+            records = parse_email_file(eml_path, folder, conn, source_path=str(eml_path))
+            if not records:
                 checkpoint['errors'].append({
                     'file_path': str(eml_path),
                     'error_type': 'ParseError',
@@ -725,15 +951,19 @@ def ingest_emails(maildir_path: Path, resume: bool = True):
                 })
                 continue
             
-            if is_duplicate_message_id(conn, record['message_id']):
-                logger.debug(f"Skipping duplicate: {record['message_id']}")
+            # Check if original record (first in list) is duplicate
+            original_record = records[0]
+            if is_duplicate_message_id(conn, original_record['message_id']):
+                logger.debug(f"Skipping duplicate: {original_record['message_id']}")
                 checkpoint['processed_count'] += 1
                 checkpoint['last_processed_path'] = str(eml_path)
                 continue
             
-            text = generate_embedding_text(record)
-            pending_records.append(record)
-            pending_texts.append(text)
+            # Process all records (original + salvaged quotes) for embeddings
+            for record in records:
+                text = generate_embedding_text(record)
+                pending_records.append(record)
+                pending_texts.append(text)
             
             if len(pending_records) >= EMBEDDING_BATCH_SIZE:
                 embeddings = embedder.encode_batch(pending_texts)
@@ -748,7 +978,7 @@ def ingest_emails(maildir_path: Path, resume: bool = True):
                     checkpoint['processed_count'] += 1
                     checkpoint['last_processed_path'] = rec.get('source_path', str(eml_path))
                 
-                logger.info(f"Processed {checkpoint['processed_count']}/{total_files} emails")
+                logger.info(f"Processed {checkpoint['processed_count']}/{total_files} emails (including salvaged quotes)")
                 
                 if checkpoint['processed_count'] >= MAX_EMAILS:
                     logger.info(f"Reached limit of {MAX_EMAILS} emails, stopping")

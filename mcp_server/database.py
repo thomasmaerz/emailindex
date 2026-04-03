@@ -86,6 +86,7 @@ def search_emails(
                            vec_distance_cosine(e.embedding, ?) as score
                     FROM emails e
                     WHERE e.id != ? AND e.embedding IS NOT NULL
+                      AND (e.source IS NULL OR e.source != 'quoted_reply')
                     ORDER BY score DESC
                     LIMIT ?
                 """, (row['embedding'], similar_to_email_id, limit))
@@ -148,6 +149,9 @@ def search_emails(
     if folder:
         where_clauses.append("e.folder = ?")
         params.append(folder)
+    
+    # Exclude quoted_reply by default (unless explicitly included)
+    where_clauses.append("(e.source IS NULL OR e.source != 'quoted_reply')")
     
     where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
     
@@ -319,6 +323,7 @@ def query_email_database(
                        vec_distance_cosine(e.embedding, ?) as score
                 FROM emails e
                 WHERE e.embedding IS NOT NULL
+                  AND (e.source IS NULL OR e.source != 'quoted_reply')
                 ORDER BY score ASC
                 LIMIT ?
             """, (query_embedding, limit * 3))
@@ -349,6 +354,7 @@ def query_email_database(
                            e.from_name, e.has_attachments, e.folder, e.body_markdown
                     FROM emails e
                     WHERE e.thread_id IN ({})
+                      AND (e.source IS NULL OR e.source != 'quoted_reply')
                     ORDER BY e.timestamp ASC
                 """.format(",".join(["?"] * len(thread_ids))), list(thread_ids))
                 
@@ -419,6 +425,9 @@ def query_email_database(
         where_clauses.append("e.has_attachments = ?")
         params.append(1 if has_attachments else 0)
     
+    # Exclude quoted_reply by default
+    where_clauses.append("(e.source IS NULL OR e.source != 'quoted_reply')")
+    
     where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
     
     sql = f"""
@@ -459,6 +468,7 @@ def query_email_database(
                    e.body_text
             FROM emails e
             WHERE e.thread_id IN ({})
+              AND (e.source IS NULL OR e.source != 'quoted_reply')
             ORDER BY e.timestamp ASC
         """.format(",".join(["?"] * len(thread_ids))), list(thread_ids))
         
@@ -511,6 +521,7 @@ def get_project_context(project_name: str, limit: int = 10) -> Optional[dict]:
                COALESCE(e.body_text, e.body_markdown) as body_text
         FROM emails e
         WHERE e.project_tags LIKE ?
+          AND (e.source IS NULL OR e.source != 'quoted_reply')
         ORDER BY e.timestamp DESC
         LIMIT ?
     """, (f"%{row['name']}%", limit))
