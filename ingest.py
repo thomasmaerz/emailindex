@@ -13,10 +13,13 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import uuid
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Queue, Empty
 from typing import Optional
 from email.header import decode_header
 from email.message import Message
@@ -568,6 +571,9 @@ def init_database(db_path: Path):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
+    cursor.execute("PRAGMA journal_mode=WAL")
+    logger.info("SQLite WAL mode enabled")
+    
     try:
         import sqlite_vec
         conn.enable_load_extension(True)
@@ -899,6 +905,8 @@ class Embedder:
         return result
 
 
+from contextlib import contextmanager
+
 def get_db_connection(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     try:
@@ -908,6 +916,22 @@ def get_db_connection(db_path: Path) -> sqlite3.Connection:
     except Exception:
         pass
     return conn
+
+
+@contextmanager
+def get_db_connection_ctx(db_path: Path):
+    """Get a DB connection with automatic cleanup. Usage: 'with get_db_connection_ctx(DB_PATH) as conn:'"""
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+    except Exception:
+        pass
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def collect_email_files(maildir_path: Path) -> list[tuple[Path, str]]:
@@ -977,7 +1001,7 @@ def insert_email(conn: sqlite3.Connection, record: dict):
             logger.warning(f"Could not insert vector: {e}")
 
 
-def ingest_emails(maildir_path: Path, resume: bool = True):
+def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int = 4):
     init_database(DB_PATH)
     
     checkpoint = load_checkpoint()
@@ -1006,93 +1030,113 @@ def ingest_emails(maildir_path: Path, resume: bool = True):
         return
     
     embedder = Embedder()
+    
+    processed_count = checkpoint.get('processed_count', 0)
+    last_processed_path = checkpoint.get('last_processed_path', '')
+    errors = checkpoint.get('errors', [])
+    
     pending_records = []
     pending_texts = []
     
-    conn = get_db_connection(DB_PATH)
-    
-    for idx, (eml_path, folder) in enumerate(email_files):
-        try:
+    def parse_worker(eml_path, folder):
+        """Worker function: parse email with its own DB connection."""
+        with get_db_connection_ctx(DB_PATH) as conn:
             records = parse_email_file(eml_path, folder, conn, source_path=str(eml_path))
-            if not records:
-                checkpoint['errors'].append({
+            return (eml_path, records)
+    
+    with ThreadPoolExecutor(max_workers=concurrent_limit) as executor:
+        future_to_path = {}
+        
+        for eml_path, folder in email_files:
+            future = executor.submit(parse_worker, eml_path, folder)
+            future_to_path[future] = eml_path
+        
+        for future in as_completed(future_to_path):
+            eml_path = future_to_path[future]
+            try:
+                _, records = future.result()
+                
+                if not records:
+                    errors.append({
+                        'file_path': str(eml_path),
+                        'error_type': 'ParseError',
+                        'error_message': 'Failed to parse email',
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    })
+                    continue
+                
+                original_record = records[0]
+                with get_db_connection_ctx(DB_PATH) as conn:
+                    if is_duplicate_message_id(conn, original_record['message_id']):
+                        logger.debug(f"Skipping duplicate: {original_record['message_id']}")
+                        processed_count += 1
+                        last_processed_path = str(eml_path)
+                        continue
+                
+                for record in records:
+                    text = generate_embedding_text(record)
+                    pending_records.append(record)
+                    pending_texts.append(text)
+                
+                if len(pending_records) >= EMBEDDING_BATCH_SIZE:
+                    embeddings = embedder.encode_batch(pending_texts)
+                    
+                    with get_db_connection_ctx(DB_PATH) as conn:
+                        for rec, emb in zip(pending_records, embeddings):
+                            rec['embedding'] = emb
+                            insert_email(conn, rec)
+                        conn.commit()
+                    
+                    for rec in pending_records:
+                        processed_count += 1
+                        last_processed_path = rec.get('source_path', str(eml_path))
+                    
+                    logger.info(f"Processed {processed_count}/{total_files} emails (including salvaged quotes)")
+                    
+                    if processed_count >= MAX_EMAILS:
+                        logger.info(f"Reached limit of {MAX_EMAILS} emails, stopping")
+                        break
+                    
+                    pending_records = []
+                    pending_texts = []
+                
+                if processed_count > 0 and processed_count % CHECKPOINT_INTERVAL == 0:
+                    checkpoint['processed_count'] = processed_count
+                    checkpoint['last_processed_path'] = last_processed_path
+                    checkpoint['errors'] = errors
+                    save_checkpoint(checkpoint)
+            
+            except Exception as e:
+                logger.error(f"Error processing {eml_path}: {e}")
+                errors.append({
                     'file_path': str(eml_path),
-                    'error_type': 'ParseError',
-                    'error_message': 'Failed to parse email',
+                    'error_type': type(e).__name__,
+                    'error_message': str(e),
                     'timestamp': datetime.now(timezone.utc).isoformat()
                 })
                 continue
-            
-            # Check if original record (first in list) is duplicate
-            original_record = records[0]
-            if is_duplicate_message_id(conn, original_record['message_id']):
-                logger.debug(f"Skipping duplicate: {original_record['message_id']}")
-                checkpoint['processed_count'] += 1
-                checkpoint['last_processed_path'] = str(eml_path)
-                continue
-            
-            # Process all records (original + salvaged quotes) for embeddings
-            for record in records:
-                text = generate_embedding_text(record)
-                pending_records.append(record)
-                pending_texts.append(text)
-            
-            if len(pending_records) >= EMBEDDING_BATCH_SIZE:
-                embeddings = embedder.encode_batch(pending_texts)
-                
-                for rec, emb in zip(pending_records, embeddings):
-                    rec['embedding'] = emb
-                    insert_email(conn, rec)
-                
-                conn.commit()
-                
-                for rec in pending_records:
-                    checkpoint['processed_count'] += 1
-                    checkpoint['last_processed_path'] = rec.get('source_path', str(eml_path))
-                
-                logger.info(f"Processed {checkpoint['processed_count']}/{total_files} emails (including salvaged quotes)")
-                
-                if checkpoint['processed_count'] >= MAX_EMAILS:
-                    logger.info(f"Reached limit of {MAX_EMAILS} emails, stopping")
-                    break
-                
-                pending_records = []
-                pending_texts = []
-            
-            if checkpoint['processed_count'] > 0 and checkpoint['processed_count'] % CHECKPOINT_INTERVAL == 0:
-                save_checkpoint(checkpoint)
-        
-        except Exception as e:
-            logger.error(f"Error processing {eml_path}: {e}")
-            checkpoint['errors'].append({
-                'file_path': str(eml_path),
-                'error_type': type(e).__name__,
-                'error_message': str(e),
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            })
-            continue
     
     if pending_records:
         embeddings = embedder.encode_batch(pending_texts)
         
-        for rec, emb in zip(pending_records, embeddings):
-            rec['embedding'] = emb
-            insert_email(conn, rec)
-        
-        conn.commit()
+        with get_db_connection_ctx(DB_PATH) as conn:
+            for rec, emb in zip(pending_records, embeddings):
+                rec['embedding'] = emb
+                insert_email(conn, rec)
+            conn.commit()
         
         for rec in pending_records:
-            checkpoint['processed_count'] += 1
-            checkpoint['last_processed_path'] = rec.get('source_path', '')
+            processed_count += 1
+            last_processed_path = rec.get('source_path', '')
     
-    conn.close()
-    
+    checkpoint['processed_count'] = processed_count
+    checkpoint['last_processed_path'] = last_processed_path
     checkpoint['completed_at'] = datetime.now(timezone.utc).isoformat()
+    checkpoint['errors'] = errors
     save_checkpoint(checkpoint)
     
-    logger.info(f"Ingestion complete: {checkpoint['processed_count']} emails processed")
+    logger.info(f"Ingestion complete: {processed_count} emails processed")
     
-    errors = checkpoint.get('errors', [])
     if errors:
         error_types = {}
         for e in errors:
@@ -1105,6 +1149,12 @@ def main():
     parser = argparse.ArgumentParser(description="Ingest emails from Maildir")
     parser.add_argument("maildir", type=Path, help="Path to Maildir directory")
     parser.add_argument("--no-resume", action="store_true", help="Start fresh, don't resume from checkpoint")
+    parser.add_argument(
+        "--concurrent-limit",
+        type=int,
+        default=4,
+        help="Number of parallel workers (default: 4)"
+    )
     
     args = parser.parse_args()
     
@@ -1114,7 +1164,7 @@ def main():
     
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     
-    ingest_emails(args.maildir, resume=not args.no_resume)
+    ingest_emails(args.maildir, resume=not args.no_resume, concurrent_limit=args.concurrent_limit)
 
 
 if __name__ == "__main__":
