@@ -926,6 +926,18 @@ def collect_email_files(maildir_path: Path) -> list[tuple[Path, str]]:
     return sorted(eml_files, key=lambda x: str(x[0]))
 
 
+def detect_mailbox_owner(conn: sqlite3.Connection) -> Optional[str]:
+    """Detect the most frequent sender as mailbox owner (for is_outbound)."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT from_address FROM emails
+        WHERE from_address IS NOT NULL AND from_address != ''
+        GROUP BY from_address ORDER BY COUNT(*) DESC LIMIT 1
+    """)
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
 def insert_email(conn: sqlite3.Connection, record: dict):
     cursor = conn.cursor()
     
@@ -940,8 +952,8 @@ def insert_email(conn: sqlite3.Connection, record: dict):
             from_address, from_name, to_addresses, cc_addresses,
             subject, body_markdown, body_plain, body_text, x_mailer,
             has_attachments, attachments, folder, raw_eml, embedding,
-            source, parent_id, content_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source, parent_id, content_hash, is_outbound
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         record['id'],
         record['message_id'],
@@ -964,7 +976,8 @@ def insert_email(conn: sqlite3.Connection, record: dict):
         embedding_blob,
         source,
         parent_id,
-        content_hash
+        content_hash,
+        record.get('is_outbound', 0)
     ))
     
     if embedding_blob:
@@ -1011,6 +1024,16 @@ def ingest_emails(maildir_path: Path, resume: bool = True):
     
     conn = get_db_connection(DB_PATH)
     
+    owner_addresses = set()
+    from mcp_server.config import Config
+    if Config.USER_EMAIL_ADDRESSES:
+        owner_addresses = set(Config.USER_EMAIL_ADDRESSES)
+    else:
+        detected_owner = detect_mailbox_owner(conn)
+        if detected_owner:
+            owner_addresses = {detected_owner}
+            logger.info(f"Auto-detected mailbox owner: {detected_owner}")
+    
     for idx, (eml_path, folder) in enumerate(email_files):
         try:
             records = parse_email_file(eml_path, folder, conn, source_path=str(eml_path))
@@ -1030,6 +1053,11 @@ def ingest_emails(maildir_path: Path, resume: bool = True):
                 checkpoint['processed_count'] += 1
                 checkpoint['last_processed_path'] = str(eml_path)
                 continue
+            
+            # Set is_outbound for all records based on owner detection
+            if owner_addresses:
+                for record in records:
+                    record['is_outbound'] = 1 if record['from_address'].lower() in {a.lower() for a in owner_addresses} else 0
             
             # Process all records (original + salvaged quotes) for embeddings
             for record in records:
@@ -1073,6 +1101,10 @@ def ingest_emails(maildir_path: Path, resume: bool = True):
             continue
     
     if pending_records:
+        if owner_addresses:
+            for rec in pending_records:
+                rec['is_outbound'] = 1 if rec['from_address'].lower() in {a.lower() for a in owner_addresses} else 0
+        
         embeddings = embedder.encode_batch(pending_texts)
         
         for rec, emb in zip(pending_records, embeddings):

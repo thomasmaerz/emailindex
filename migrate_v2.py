@@ -54,6 +54,23 @@ def migrate():
     print(f"Migrated {cursor.rowcount} rows")
     
     cursor.execute("""
+        SELECT from_address FROM emails
+        WHERE from_address IS NOT NULL AND from_address != ''
+        GROUP BY from_address ORDER BY COUNT(*) DESC LIMIT 1
+    """)
+    row = cursor.fetchone()
+    if row:
+        owner = row[0]
+        cursor.execute("""
+            UPDATE emails SET is_outbound = CASE
+                WHEN from_address = ? THEN 1 ELSE 0 END
+            WHERE is_outbound IS NULL
+        """, (owner,))
+        print(f"Backfilled is_outbound for {cursor.rowcount} rows (owner: {owner})")
+    else:
+        print("No emails found to backfill is_outbound")
+    
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS project_registry (
             name TEXT PRIMARY KEY,
             aliases TEXT,

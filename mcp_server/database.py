@@ -317,16 +317,24 @@ def query_email_database(
         try:
             query_embedding = _encode_text_to_embedding(semantic_query)
             
-            cursor.execute("""
+            vector_where = "e.embedding IS NOT NULL AND (e.source IS NULL OR e.source != 'quoted_reply')"
+            vector_params = [query_embedding]
+            
+            if is_outbound is not None:
+                vector_where += " AND e.is_outbound = ?"
+                vector_params.append(1 if is_outbound else 0)
+            
+            vector_params.append(limit * 3)
+            
+            cursor.execute(f"""
                 SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address,
                        e.from_name, e.has_attachments, e.folder, e.body_markdown,
                        vec_distance_cosine(e.embedding, ?) as score
                 FROM emails e
-                WHERE e.embedding IS NOT NULL
-                  AND (e.source IS NULL OR e.source != 'quoted_reply')
+                WHERE {vector_where}
                 ORDER BY score ASC
                 LIMIT ?
-            """, (query_embedding, limit * 3))
+            """, vector_params)
             
             vector_results = cursor.fetchall()
             
@@ -547,3 +555,31 @@ def get_project_context(project_name: str, limit: int = 10) -> Optional[dict]:
         "project": project,
         "emails": results
     }
+
+
+def list_projects(limit: int = 20) -> list[dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT name, aliases, summary, created_at
+        FROM project_registry
+        ORDER BY name
+        LIMIT ?
+    """, (limit,))
+    
+    results = []
+    for row in cursor.fetchall():
+        aliases_list = []
+        if row["aliases"]:
+            aliases_list = [a.strip() for a in row["aliases"].split(",") if a.strip()]
+        
+        results.append({
+            "name": row["name"],
+            "aliases": aliases_list,
+            "summary": row["summary"],
+            "created_at": row["created_at"]
+        })
+    
+    close_connection()
+    return results
