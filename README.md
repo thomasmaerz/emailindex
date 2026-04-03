@@ -1,6 +1,31 @@
 # Email Intelligence System (emailindex)
 
-**Email Intelligence System** is a powerful indexing and search engine for 12+ years of Maildir archives. It combines traditional full-text search with modern semantic vector search, exposed via the Model Context Protocol (MCP).
+![Python 3.12+](https://img.shields.io/badge/Python-3.12+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
+![MCP](https://img.shields.io/badge/Protocol-MCP%20%28JSON--RPC%202.0%29-4B32C3?style=for-the-badge)
+![License MIT](https://img.shields.io/badge/License-MIT-9B59B6?style=for-the-badge)
+
+![Vector Search](https://img.shields.io/badge/Search-Vector%20%2B%20FTS5-2ECC71?style=for-the-badge)
+![Deduplication](https://img.shields.io/badge/Attachments-SHA--256%20Dedup-F39C12?style=for-the-badge)
+![AI Classification](https://img.shields.io/badge/AI-Gemini%20Classification-4285F4?style=for-the-badge)
+![Quote Salvage](https://img.shields.io/badge/Feature-Quote%20Salvage-E67E22?style=for-the-badge)
+
+A powerful indexing and search engine for Maildir email archives. Combines traditional full-text search with modern semantic vector search, exposed via the Model Context Protocol (MCP) for AI assistants.
+
+---
+
+## At a Glance
+
+| | |
+|---|---|
+| 🗄️ **Storage** | SQLite with FTS5 + sqlite-vec |
+| 🧠 **Embeddings** | 384-dimensional via BAAI/bge-small-en-v1.5 |
+| 🔍 **Search** | Vector similarity + Full-text (BM25) + Tag filters |
+| 🧵 **Threading** | RFC 822 References/In-Reply-To with subject fallback |
+| 📎 **Attachments** | SHA-256 deduplicated, stored once on disk |
+| 💬 **Quote Salvage** | Extracts quoted replies with 2-tier dedup (hash + semantic) |
+| 🤖 **AI Classification** | Gemini-powered project discovery + email tagging |
+| 🔌 **Protocol** | MCP (JSON-RPC 2.0 over stdio) |
 
 ---
 
@@ -10,9 +35,12 @@
 - **Full-Text Search (FTS5)**: SQLite FTS5 with BM25 ranking for exact keyword matching.
 - **Intelligent Threading**: Reconstructs conversation threads using RFC 822 References/In-Reply-To chains with subject-based fallback for emails missing standard headers.
 - **Deduplicated Attachments**: SHA-256 based deduplication ensures that multiple copies of the same file across different emails only occupy space once.
+- **Quote Salvage**: Extracts quoted reply blocks from inline email text using EmailReplyParser + custom Outlook pattern detection, with two-tier deduplication (hash-based + semantic similarity at 0.98 threshold).
+- **HTML Body Support**: Salvages quoted replies from HTML-only emails (no plain text part) by extracting text while preserving Outlook quote structure.
 - **Resumable Ingestion**: Batch-based ingestion pipeline with checkpointing and error recovery.
 - **Concurrency Support**: Thread-local database connections for safe parallel MCP requests.
 - **Model Context Protocol (MCP)**: Exposes search and retrieval tools directly to AI assistants like Claude Desktop or OpenCode.
+- **AI-Powered Classification**: Gemini-based project discovery and email tagging with checkpoint-based resumption.
 - **Project Context**: Tag-based email categorization with project registry for contextual AI queries.
 
 ---
@@ -26,21 +54,35 @@ graph TB
         B --> C[Parse & Extract]
         C --> D[HTML to Markdown]
         C --> E[SHA-256 Dedup]
-        C --> F[Generate Embeddings]
-        F --> G[SentenceTransformer bge-small-en-v1.5]
+        C --> F[Quote Salvage]
+        F --> F1[EmailReplyParser]
+        F --> F2[Outlook Patterns]
+        F --> F3[Tier 1: Hash Dedup]
+        F --> F4[Tier 2: Semantic Dedup]
+        C --> G[Generate Embeddings]
+        G --> G1[SentenceTransformer bge-small-en-v1.5]
         D --> H[emails table]
         E --> I[attachments/ on disk]
-        F --> J[email_vectors table]
+        G --> J[email_vectors table]
         H --> K[emails_fts FTS5 index]
+        H --> L[email_category_fts FTS5]
+    end
+
+    subgraph "Classification Pipeline"
+        M[classify_emails.py] --> N[Gemini AI]
+        N --> O[Project Discovery]
+        N --> P[Email Tagging]
+        O --> H
+        P --> H
     end
 
     subgraph "MCP Server"
-        L[AI Assistant OpenCode / Claude] --> M[run-mcp-server.py JSON-RPC 2.0]
-        M --> N[mcp_server/server.py Tool routing]
-        N --> O[mcp_server/database.py Query execution]
-        O --> H
-        O --> J
-        O --> K
+        Q[AI Assistant OpenCode / Claude] --> R[run-mcp-server.py JSON-RPC 2.0]
+        R --> S[mcp_server/server.py Tool routing]
+        S --> T[mcp_server/database.py Query execution]
+        T --> H
+        T --> J
+        T --> K
     end
 
     subgraph "Storage"
@@ -48,6 +90,7 @@ graph TB
         I
         J
         K
+        L
     end
 ```
 
@@ -60,20 +103,26 @@ graph TB
 | Database Layer | `mcp_server/database.py` | SQLite queries, vector search, lazy embedding model |
 | Data Models | `mcp_server/models.py` | Pydantic validation (EmailRecord, SearchParams, etc.) |
 | Configuration | `mcp_server/config.py` | Paths, model settings, embedding dimensions |
-| Ingestion | `ingest.py` | Maildir parsing, embedding generation, storage |
+| Ingestion | `ingest.py` | Maildir parsing, embedding generation, quote salvage, storage |
+| Classification | `classify_emails.py` | Gemini-powered project discovery & email tagging |
+| Quote Salvage | `salvage_quotes.py` | Standalone re-salvage tool for already-ingested emails |
 | Migration | `migrate_v2.py` | Schema migration for v2 columns (tags, threading) |
 
 ---
 
 ## Tech Stack
 
-- **Python 3.12+**
-- **Conda** (Recommended for dependency management)
-- **SQLite** with `fts5` and `sqlite-vec` extensions
-- **Sentence-Transformers** (`BAAI/bge-small-en-v1.5`)
-- **Pydantic v2** for robust data validation
-- **Zstandard** for email body compression
-- **BeautifulSoup4 & Markdownify** for HTML-to-Markdown conversion
+| Category | Technology |
+|----------|------------|
+| **Language** | ![Python](https://img.shields.io/badge/Python-3.12+-3776AB?logo=python) |
+| **Database** | ![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite) + FTS5 + [sqlite-vec](https://github.com/asg017/sqlite-vec) |
+| **Embeddings** | [Sentence-Transformers](https://www.sbert.net/) — `BAAI/bge-small-en-v1.5` (384-dim) |
+| **AI** | [Google Gemini](https://ai.google.dev/) — Project discovery & classification |
+| **Parsing** | [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) + [Markdownify](https://github.com/matthewwithanm/python-markdownify) |
+| **Quote Detection** | [Email Reply Parser](https://github.com/WillStedden/email-reply-parser) + custom Outlook regex |
+| **Validation** | [Pydantic v2](https://docs.pydantic.dev/) |
+| **Compression** | [Zstandard](https://github.com/facebook/zstd) for raw email storage |
+| **Testing** | [pytest](https://docs.pytest.org/) + custom validation scripts |
 
 ---
 
@@ -95,18 +144,68 @@ python3 ingest.py /path/to/your/maildir
 
 This will:
 1. Parse all `.eml` files from your Maildir
-2. Generate 384-dimensional semantic embeddings
-3. Compress and store raw email content with zstd
-4. Deduplicate attachments to `attachments/`
-5. Build FTS5 index and populate vector database
+2. Convert HTML bodies to clean Markdown
+3. Extract quoted reply blocks and salvage them as separate records
+4. Generate 384-dimensional semantic embeddings
+5. Compress and store raw email content with zstd
+6. Deduplicate attachments to `attachments/`
+7. Build FTS5 index and populate vector database
 
-### 3. MCP Server
+### 3. AI Classification (Optional)
+
+```bash
+export GEMINI_API_KEY="your-api-key"
+python3 classify_emails.py
+```
+
+Auto-discovers projects from email content and tags emails with `category_tags` and `project_tags`. Supports checkpoint-based resumption.
+
+### 4. MCP Server
 
 ```bash
 python3 run-mcp-server.py --stdio
 ```
 
 The wrapper script handles JSON-RPC 2.0 protocol handshake (`initialize`, `initialized`) and response formatting.
+
+---
+
+## Quote Salvage
+
+The quote salvage system extracts quoted reply blocks from inline email text and stores them as separate `source='quoted_reply'` records linked to their parent email via `parent_id`.
+
+### How It Works
+
+```mermaid
+flowchart LR
+    A[Email Body] --> B{Plain text?}
+    B -->|yes| C[EmailReplyParser]
+    B -->|no| D[Extract text from HTML]
+    D --> C
+    C --> E{Fragments found?}
+    E -->|yes| F[Outlook Pattern Fallback]
+    E -->|no| F
+    F --> G[Tier 1: Hash Dedup]
+    G --> H[Tier 2: Semantic Dedup]
+    H --> I[Create quoted_reply record]
+```
+
+1. **EmailReplyParser**: Parses standard email reply structures to identify quoted fragments
+2. **Outlook Pattern Fallback**: Custom regex detection for Outlook-style quote blocks (`From: ... Sent: ... To: ... Subject: ...`)
+3. **Tier 1 — Hash Dedup**: SHA-256 hash of normalized content (signatures stripped, lowercased, whitespace collapsed)
+4. **Tier 2 — Semantic Dedup**: Cosine similarity >= 0.98 within the same thread using sentence embeddings
+
+### HTML-Only Emails
+
+For emails with no plain text part (HTML-only), the system extracts text content using Beautiful Soup while preserving structural elements needed for quote pattern detection.
+
+### Post-Ingestion Salvage
+
+To re-salvage quotes from already-ingested emails (e.g., after improving the salvage algorithm):
+
+```bash
+python3 salvage_quotes.py
+```
 
 ---
 
@@ -177,7 +276,7 @@ flowchart LR
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `semantic_query` | string | Vector search text - generates embedding at query time |
+| `semantic_query` | string | Vector search text — generates embedding at query time |
 | `exact_keywords` | string | FTS5 exact keyword match |
 | `category_filter` | string | Comma-separated category tags |
 | `project_filter` | string | Comma-separated project tags |
@@ -190,6 +289,20 @@ flowchart LR
 | `limit` | integer | Max results (1-50, default: 10) |
 | `include_full_thread` | boolean | Return full conversation thread |
 
+**Example:**
+```python
+# Find emails about project planning
+query_email_database(semantic_query="quarterly planning meeting", limit=10)
+
+# Exact keyword search with filters
+query_email_database(
+    exact_keywords="invoice",
+    date_from="2024-01-01",
+    date_to="2024-12-31",
+    has_attachments=True
+)
+```
+
 ### `get_project_context`
 
 Get project metadata and related emails from the project registry.
@@ -200,6 +313,12 @@ Get project metadata and related emails from the project registry.
 |-----------|------|-------------|
 | `project_name` | string | Project name or alias (required) |
 | `limit` | integer | Max emails to return (1-50, default: 10) |
+
+**Example:**
+```python
+get_project_context(project_name="ProjectAlpha", limit=10)
+# Returns: { "project": {...}, "emails": [...] }
+```
 
 ---
 
@@ -218,7 +337,7 @@ sequenceDiagram
     Client->>Server: query_email_database(semantic_query="quarterly planning")
     Server->>DB: query_email_database()
     DB->>Model: _get_embedding_model()
-    Note over Model: Lazy load on first call caches for reuse
+    Note over Model: Lazy load on first call, cached for reuse
     Model-->>DB: Loaded model
     DB->>Model: encode("quarterly planning")
     Model-->>DB: float32[384] array
@@ -238,15 +357,15 @@ sequenceDiagram
     participant DB as database.py
     participant SQLite as SQLite
 
-    Client->>Server: search_emails(query="meeting notes")
-    Server->>DB: search_emails()
+    Client->>Server: query_email_database(exact_keywords="meeting notes")
+    Server->>DB: query_email_database()
     DB->>SQLite: FTS5 MATCH + metadata filters
     SQLite-->>DB: Results with thread_id
     DB-->>Server: EmailSearchResult[]
     Server-->>Client: Results with thread_id
 
-    Client->>Server: get_conversation(thread_id="thread-abc123")
-    Server->>DB: get_conversation()
+    Client->>Server: query_email_database(include_full_thread=true)
+    Server->>DB: get_conversation(thread_id)
     DB->>SQLite: SELECT WHERE thread_id = ?
     Note over DB: Fallback: subject_thread_key if no thread_id match
     SQLite-->>DB: All emails in thread
@@ -287,12 +406,12 @@ erDiagram
         TEXT folder "Maildir folder"
         BLOB raw_eml "Zstd compressed"
         BLOB embedding "float32[384]"
-        TEXT sender "Canonical sender"
-        TEXT recipients "All recipients JSON"
-        TEXT body_text "Cleaned content"
-        TEXT category_tags "JSON array"
-        TEXT project_tags "JSON array"
-        INTEGER is_outbound "0 or 1"
+        TEXT sender "Canonical sender (v2)"
+        TEXT recipients "All recipients JSON (v2)"
+        TEXT body_text "Cleaned content (v2)"
+        TEXT category_tags "JSON array (v2)"
+        TEXT project_tags "JSON array (v2)"
+        INTEGER is_outbound "0 or 1 (v2)"
         TEXT parent_id "Parent for salvaged replies"
         TEXT source "original or quoted_reply"
         TEXT content_hash "SHA-256 normalized body"
@@ -315,11 +434,62 @@ erDiagram
 
     project_registry {
         TEXT name PK
-        TEXT aliases
+        TEXT aliases "JSON array"
         TEXT summary
         TEXT created_at
     }
+
+    email_category_fts {
+        TEXT category_tags "FTS5 indexed"
+        TEXT project_tags "FTS5 indexed"
+    }
 ```
+
+---
+
+## Post-Ingestion Tools
+
+| Tool | Purpose |
+|------|---------|
+| `salvage_quotes.py` | Re-salvage quoted replies from already-ingested emails (e.g., after improving the salvage algorithm) |
+| `classify_emails.py` | Run AI-powered project discovery and email tagging (requires `GEMINI_API_KEY`) |
+| `migrate_v2.py` | Apply schema migrations for v2 columns (tags, threading, sender normalization) |
+
+---
+
+## Testing
+
+The project includes both integration validation scripts and pytest-based unit tests.
+
+### Unit Tests (pytest)
+
+```bash
+pytest tests/test_quote_salvage.py -v
+```
+
+Covers:
+- Outlook quote pattern detection
+- EmailReplyParser integration
+- Tier 1 (hash) deduplication
+- Tier 2 (semantic similarity) deduplication
+- HTML-only email salvage
+- End-to-end integration
+
+### Integration Validation
+
+```bash
+python tests/run_all_validations.py           # Summary
+python tests/run_all_validations.py --verbose # Detailed
+python tests/run_all_validations.py --json    # Machine-readable
+```
+
+Validates:
+- Maildir-to-DB field fidelity
+- Attachment pipeline integrity
+- Vector/embedding coverage
+- Content hash uniqueness
+- Parent-child relationships
+- MCP query filters
 
 ---
 
@@ -330,7 +500,7 @@ erDiagram
 **Symptom:** "Operation timed out after 30000ms"
 
 **Solutions:**
-1. Use `run-mcp-server.py` (not `-m mcp_server.server`) - it handles the JSON-RPC 2.0 handshake
+1. Use `run-mcp-server.py` (not `-m mcp_server.server`) — it handles the JSON-RPC 2.0 handshake
 2. Check `/tmp/mcp_start.log` for server logs
 3. Test handshake: `echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | python3 run-mcp-server.py`
 
