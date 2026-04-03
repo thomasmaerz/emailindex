@@ -71,11 +71,11 @@ def salvage_quotes():
     checkpoint = load_checkpoint()
     
     query = """
-        SELECT id, thread_id, subject, sender, recipients, body_text, embedding
+        SELECT id, thread_id, subject, sender, recipients, COALESCE(body_text, body_markdown) AS body_text, embedding
         FROM emails 
         WHERE (source = 'original' OR source IS NULL)
-          AND body_text IS NOT NULL
-          AND body_text != ''
+          AND COALESCE(body_text, body_markdown) IS NOT NULL
+          AND COALESCE(body_text, body_markdown) != ''
     """
     
     if checkpoint.get("last_email_id"):

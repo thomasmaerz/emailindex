@@ -99,9 +99,9 @@ def discover_projects(checkpoint: dict) -> int:
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT DISTINCT subject, body_text 
+        SELECT DISTINCT subject, COALESCE(body_text, body_markdown) AS body_text 
         FROM emails 
-        WHERE body_text IS NOT NULL AND body_text != ''
+        WHERE COALESCE(body_text, body_markdown) IS NOT NULL AND COALESCE(body_text, body_markdown) != ''
         ORDER BY timestamp DESC
         LIMIT 500
     """)
@@ -175,7 +175,7 @@ def classify_emails(checkpoint: dict) -> int:
     project_list = ", ".join([p[0] for p in projects])
 
     query = """
-        SELECT id, subject, body_text, sender, recipients
+        SELECT id, subject, COALESCE(body_text, body_markdown) AS body_text, sender, recipients
         FROM emails
         WHERE category_tags IS NULL OR category_tags = ''
     """

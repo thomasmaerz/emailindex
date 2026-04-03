@@ -81,6 +81,10 @@ def run_vector_validation(verbose: bool = False) -> tuple[bool, str, dict]:
     return run_validation_script("validate_issue4.py", verbose)
 
 
+def run_body_text_validation(verbose: bool = False) -> tuple[bool, str, dict]:
+    return run_validation_script("validate_body_text.py", verbose)
+
+
 def format_summary(results: dict, verbose: bool = False) -> str:
     lines = []
     lines.append("")
@@ -194,7 +198,8 @@ def run_all_validations(
     phases = [
         ("Extraction Pipeline", lambda: run_extraction_validation(verbose)),
         ("Attachment Pipeline", lambda: run_attachments_validation(verbose)),
-        ("Vector Pipeline", lambda: run_vector_validation(verbose))
+        ("Vector Pipeline", lambda: run_vector_validation(verbose)),
+        ("Body Text Pipeline", lambda: run_body_text_validation(verbose))
     ]
     
     if filter_by:

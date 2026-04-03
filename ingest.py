@@ -503,6 +503,7 @@ def _make_salvaged_record(content: str, content_hash: str, parent_record: dict) 
         'subject': f"[Salvaged] {parent_record['subject']}",
         'body_markdown': content,
         'body_plain': content,
+        'body_text': content,
         'x_mailer': None,
         'has_attachments': 0,
         'attachments': '[]',
@@ -831,6 +832,7 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
             'subject': subject,
             'body_markdown': '',
             'body_plain': plain_body,
+            'body_text': '',
             'x_mailer': x_mailer,
             'has_attachments': 1 if has_attachments else 0,
             'attachments': json.dumps(attachments),
@@ -860,6 +862,7 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
             body_markdown = plain_body or ""
         
         parent_record['body_markdown'] = body_markdown.strip()
+        parent_record['body_text'] = body_markdown.strip()
         
         return [parent_record] + salvaged_records
     
@@ -935,10 +938,10 @@ def insert_email(conn: sqlite3.Connection, record: dict):
         INSERT INTO emails (
             id, message_id, thread_id, subject_thread_key, timestamp,
             from_address, from_name, to_addresses, cc_addresses,
-            subject, body_markdown, body_plain, x_mailer,
+            subject, body_markdown, body_plain, body_text, x_mailer,
             has_attachments, attachments, folder, raw_eml, embedding,
             source, parent_id, content_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         record['id'],
         record['message_id'],
@@ -952,6 +955,7 @@ def insert_email(conn: sqlite3.Connection, record: dict):
         record['subject'],
         record['body_markdown'],
         record['body_plain'],
+        record.get('body_text', ''),
         record['x_mailer'],
         record['has_attachments'],
         record['attachments'],
