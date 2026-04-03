@@ -223,7 +223,7 @@ Thanks,
 Bob"""
             parent['to_addresses'] = json.dumps(['bob@example.com'])
             
-            records = salvage_quotes(parent['body_plain'], parent, conn)
+            records = salvage_quotes(plain_text=parent['body_plain'], parent_record=parent, conn=conn)
             
             assert len(records) >= 1
             assert records[0]['source'] == 'quoted_reply'
@@ -241,7 +241,7 @@ Bob"""
             parent['body_plain'] = ''
             parent['to_addresses'] = json.dumps(['bob@example.com'])
             
-            records = salvage_quotes(parent['body_plain'], parent, conn)
+            records = salvage_quotes(plain_text=parent['body_plain'], parent_record=parent, conn=conn)
             assert len(records) == 0
             conn.close()
     
@@ -261,7 +261,7 @@ Subject: Test
 This is the quoted content that should be salvaged."""
             parent['to_addresses'] = json.dumps(['bob@example.com'])
             
-            records1 = salvage_quotes(parent['body_plain'], parent, conn)
+            records1 = salvage_quotes(plain_text=parent['body_plain'], parent_record=parent, conn=conn)
             assert len(records1) >= 1
             
             for rec in records1:
@@ -269,7 +269,7 @@ This is the quoted content that should be salvaged."""
                 insert_email(conn, rec)
             conn.commit()
             
-            records2 = salvage_quotes(parent['body_plain'], parent, conn)
+            records2 = salvage_quotes(plain_text=parent['body_plain'], parent_record=parent, conn=conn)
             assert len(records2) == 0
             conn.close()
 
@@ -311,3 +311,75 @@ class TestHTMLTextExtraction:
         text = _extract_text_from_html(html)
         assert 'My reply text here' in text
         assert 'quoted content' in text
+
+
+class TestSalvageQuotesFromHTML:
+    def test_salvage_from_html_with_outlook_quote(self):
+        """Test salvage_quotes works when given raw HTML input."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+            
+            html = """<html><body>
+                <p>Thanks for the update.</p>
+                <div>
+                    <p><b>From:</b> Bob Smith &lt;bob@example.com&gt;</p>
+                    <p><b>Sent:</b> Monday, January 15, 2024 10:30 AM</p>
+                    <p><b>To:</b> Alice Jones &lt;alice@example.com&gt;</p>
+                    <p><b>Subject:</b> Project Update</p>
+                    <p>Hi Alice, I wanted to follow up on our discussion about the quarterly planning meeting. We discussed budget allocations and resource planning for Q1 2024. Please review the attached documents and let me know your thoughts.</p>
+                </div>
+            </body></html>"""
+            
+            parent = SAMPLE_PARENT.copy()
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+            parent['body_plain'] = ''  # No plain text
+            
+            records = salvage_quotes(html_text=html, parent_record=parent, conn=conn)
+            
+            assert len(records) >= 1
+            assert records[0]['source'] == 'quoted_reply'
+            assert 'From:' in records[0]['body_markdown']
+            assert len(records[0]['body_markdown']) > 100
+            conn.close()
+    
+    def test_salvage_from_html_no_quotes_returns_empty(self):
+        """Test salvage_quotes returns empty when HTML has no quote patterns."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+            
+            html = "<html><body><p>Just a simple message with no quotes.</p></body></html>"
+            
+            parent = SAMPLE_PARENT.copy()
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+            
+            records = salvage_quotes(html_text=html, parent_record=parent, conn=conn)
+            assert len(records) == 0
+            conn.close()
+    
+    def test_salvage_prefers_plain_text_over_html(self):
+        """Test that plain_text is preferred when both are available."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+            
+            plain_text = """Reply here.
+
+From: Bob <bob@example.com>
+Sent: Monday, January 15, 2024 10:30 AM
+To: Alice <alice@example.com>
+Subject: Test
+
+This is the quoted content from plain text that should be salvaged."""
+            
+            html = "<html><body><p>Different HTML content</p></body></html>"
+            
+            parent = SAMPLE_PARENT.copy()
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+            
+            records = salvage_quotes(plain_text=plain_text, html_text=html, parent_record=parent, conn=conn)
+            
+            assert len(records) >= 1
+            assert 'From: Bob' in records[0]['body_markdown']
+            conn.close()
