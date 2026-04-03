@@ -404,10 +404,13 @@ def query_email_database(
             tags.extend([p.strip() for p in project_filter.split(",")])
         
         if tags:
-            tag_conditions = " OR ".join(["category_tags LIKE ?" for _ in tags])
-            tag_conditions += " OR " + " OR ".join(["project_tags LIKE ?" for _ in tags])
+            cat_tags = tags[:]
+            proj_tags = tags[:]
+            tag_conditions = " OR ".join(["category_tags LIKE ?" for _ in cat_tags])
+            tag_conditions += " OR " + " OR ".join(["project_tags LIKE ?" for _ in proj_tags])
             where_clauses.append(f"({tag_conditions})")
-            params.extend([f"%{t}%" for t in tags])
+            params.extend([f"%{t}%" for t in cat_tags])
+            params.extend([f"%{t}%" for t in proj_tags])
     
     if date_from:
         where_clauses.append("e.timestamp >= ?")

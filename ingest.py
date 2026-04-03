@@ -52,6 +52,41 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+CATEGORY_KEYWORDS = {
+    "scheduling": ["meeting", "calendar", "invite", "accepted", "declined", "tentative"],
+    "security": ["security", "audit", "compliance", "nist", "cmmc", "assessment", "risk"],
+    "infrastructure": ["server", "network", "exchange", "vmware", "domain join", "active directory"],
+    "project_management": ["project", "pmo", "requirements", "deliverable", "milestone", "sprint", "scrum"],
+    "finance": ["invoice", "payment", "budget", "cost", "purchase", "contract", "renewal"],
+    "hr": ["benefits", "enrollment", "performance", "training", "onboarding", "pto"],
+    "social": ["coffee", "conversation", "lunch", "birthday", "holiday", "celebration"],
+    "vendor": ["demo", "trial", "license", "renewal", "contract", "proposal", "quote"],
+    "system_notification": ["undeliverable", "bounce", "auto-reply", "out of office", "delivery status"],
+}
+
+
+def classify_email(record: dict) -> list[str]:
+    subject = record.get("subject", "").lower()
+    body = record.get("body_markdown", "")[:1500].lower()
+    text_to_search = f"{subject} {body}"
+    
+    matched_categories = set()
+    
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        for keyword in keywords:
+            if " " in keyword:
+                if keyword in text_to_search:
+                    matched_categories.add(category)
+                    break
+            else:
+                pattern = re.compile(r'\b' + re.escape(keyword) + r'\b')
+                if pattern.search(text_to_search):
+                    matched_categories.add(category)
+                    break
+    
+    return sorted(list(matched_categories))
+
+
 class EncodingHandler:
     FALLBACK_ENCODINGS = [
         'utf-8', 'iso-8859-1', 'windows-1252', 'us-ascii',
@@ -590,6 +625,7 @@ def init_database(db_path: Path):
             subject TEXT NOT NULL,
             body_markdown TEXT NOT NULL,
             body_plain TEXT,
+            body_text TEXT,
             x_mailer TEXT,
             has_attachments INTEGER NOT NULL DEFAULT 0,
             attachments TEXT,
@@ -598,7 +634,12 @@ def init_database(db_path: Path):
             embedding BLOB,
             source TEXT DEFAULT 'original',
             parent_id TEXT,
-            content_hash TEXT
+            content_hash TEXT,
+            sender TEXT,
+            recipients TEXT,
+            category_tags TEXT,
+            project_tags TEXT,
+            is_outbound INTEGER
         )
     """)
     
@@ -864,6 +905,19 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
         parent_record['body_markdown'] = body_markdown.strip()
         parent_record['body_text'] = body_markdown.strip()
         
+        tags = classify_email(parent_record)
+        parent_record['category_tags'] = json.dumps(tags)
+        parent_record['sender'] = from_address
+        all_recipients = to_addresses + (cc_addresses or [])
+        parent_record['recipients'] = json.dumps(all_recipients)
+        parent_record['project_tags'] = '[]'
+        
+        for salvaged in salvaged_records:
+            salvaged['category_tags'] = json.dumps(tags)
+            salvaged['sender'] = from_address
+            salvaged['recipients'] = json.dumps(all_recipients)
+            salvaged['project_tags'] = '[]'
+        
         return [parent_record] + salvaged_records
     
     except Exception as e:
@@ -952,8 +1006,9 @@ def insert_email(conn: sqlite3.Connection, record: dict):
             from_address, from_name, to_addresses, cc_addresses,
             subject, body_markdown, body_plain, body_text, x_mailer,
             has_attachments, attachments, folder, raw_eml, embedding,
-            source, parent_id, content_hash, is_outbound
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source, parent_id, content_hash, is_outbound,
+            category_tags, sender, recipients, project_tags
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         record['id'],
         record['message_id'],
@@ -977,7 +1032,11 @@ def insert_email(conn: sqlite3.Connection, record: dict):
         source,
         parent_id,
         content_hash,
-        record.get('is_outbound', 0)
+        record.get('is_outbound', 0),
+        record.get('category_tags'),
+        record.get('sender'),
+        record.get('recipients'),
+        record.get('project_tags', '[]')
     ))
     
     if embedding_blob:

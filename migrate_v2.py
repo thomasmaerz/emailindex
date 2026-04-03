@@ -5,10 +5,46 @@ Adds new columns, FTS5 tables, triggers, and indexes.
 """
 
 import sqlite3
+import json
+import re
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "db" / "emails.db"
+
+CATEGORY_KEYWORDS = {
+    "scheduling": ["meeting", "calendar", "invite", "accepted", "declined", "tentative"],
+    "security": ["security", "audit", "compliance", "nist", "cmmc", "assessment", "risk"],
+    "infrastructure": ["server", "network", "exchange", "vmware", "domain join", "active directory"],
+    "project_management": ["project", "pmo", "requirements", "deliverable", "milestone", "sprint", "scrum"],
+    "finance": ["invoice", "payment", "budget", "cost", "purchase", "contract", "renewal"],
+    "hr": ["benefits", "enrollment", "performance", "training", "onboarding", "pto"],
+    "social": ["coffee", "conversation", "lunch", "birthday", "holiday", "celebration"],
+    "vendor": ["demo", "trial", "license", "renewal", "contract", "proposal", "quote"],
+    "system_notification": ["undeliverable", "bounce", "auto-reply", "out of office", "delivery status"],
+}
+
+
+def classify_email(subject: str, body: str) -> list[str]:
+    subject = subject.lower() if subject else ""
+    body = body[:1500].lower() if body else ""
+    text_to_search = f"{subject} {body}"
+    
+    matched_categories = set()
+    
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        for keyword in keywords:
+            if " " in keyword:
+                if keyword in text_to_search:
+                    matched_categories.add(category)
+                    break
+            else:
+                pattern = re.compile(r'\b' + re.escape(keyword) + r'\b')
+                if pattern.search(text_to_search):
+                    matched_categories.add(category)
+                    break
+    
+    return sorted(list(matched_categories))
 
 def migrate():
     conn = sqlite3.connect(DB_PATH)
@@ -69,6 +105,26 @@ def migrate():
         print(f"Backfilled is_outbound for {cursor.rowcount} rows (owner: {owner})")
     else:
         print("No emails found to backfill is_outbound")
+    
+    print("Backfilling category_tags...")
+    cursor.execute("SELECT id, subject, body_markdown FROM emails WHERE category_tags IS NULL OR category_tags = ''")
+    rows = cursor.fetchall()
+    tag_counts = {}
+    batch_size = 500
+    for i, row in enumerate(rows):
+        email_id, subject, body_markdown = row
+        tags = classify_email(subject, body_markdown or "")
+        if tags:
+            for tag in tags:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        cursor.execute("UPDATE emails SET category_tags = ? WHERE id = ?", (json.dumps(tags), email_id))
+        if (i + 1) % batch_size == 0:
+            conn.commit()
+            print(f"  Processed {i + 1}/{len(rows)} emails...")
+    conn.commit()
+    print(f"Backfilled category_tags for {len(rows)} rows")
+    if tag_counts:
+        print(f"  Tag distribution: {tag_counts}")
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS project_registry (
