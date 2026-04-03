@@ -294,11 +294,149 @@ This is the quoted content that should be salvaged."""
             conn.close()
 
 
-class TestParseEmailFileHTMLSalvage:
-    def test_html_body_passed_to_salvage_when_plain_empty(self):
-        """Test that parse_email_file passes HTML to salvage when plain is empty."""
-        import inspect
-        from ingest import salvage_quotes
-        sig = inspect.signature(salvage_quotes)
-        assert 'html_text' in sig.parameters
-        assert 'plain_text' in sig.parameters
+class TestHTMLTextExtraction:
+    def test_extract_text_from_html_preserves_outlook_structure(self):
+        html = """<html><body>
+            <p>Reply to this message.</p>
+            <div>
+                <p><b>From:</b> Bob Smith &lt;bob@example.com&gt;</p>
+                <p><b>Sent:</b> Monday, January 15, 2024 10:30 AM</p>
+                <p><b>To:</b> Alice Jones &lt;alice@example.com&gt;</p>
+                <p><b>Subject:</b> Meeting Tomorrow</p>
+                <p>Hi Alice, Can we meet tomorrow at 2pm? I'd like to discuss the project timeline and deliverables. Thanks, Bob</p>
+            </div>
+        </body></html>"""
+        from ingest import _extract_text_from_html
+        text = _extract_text_from_html(html)
+        assert 'From:' in text
+        assert 'Sent:' in text
+        assert 'To:' in text
+        assert 'Subject:' in text
+        assert 'Meeting Tomorrow' in text
+        assert len(text) > 100
+    
+    def test_extract_text_from_html_empty_returns_empty(self):
+        from ingest import _extract_text_from_html
+        assert _extract_text_from_html('') == ''
+        assert _extract_text_from_html('') == ''
+    
+    def test_extract_text_from_html_blockquote_handling(self):
+        html = """<html><body>
+            <p>My reply text here.</p>
+            <blockquote>
+                <p>This is the quoted content that should be preserved in the extraction.</p>
+            </blockquote>
+        </body></html>"""
+        from ingest import _extract_text_from_html
+        text = _extract_text_from_html(html)
+        assert 'My reply text here' in text
+        assert 'quoted content' in text
+
+
+class TestSalvageQuotesFromHTML:
+    def test_salvage_from_html_with_outlook_quote(self):
+        """Test salvage_quotes works when given raw HTML input."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+            
+            html = """<html><body>
+                <p>Thanks for the update.</p>
+                <div>
+                    <p><b>From:</b> Bob Smith &lt;bob@example.com&gt;</p>
+                    <p><b>Sent:</b> Monday, January 15, 2024 10:30 AM</p>
+                    <p><b>To:</b> Alice Jones &lt;alice@example.com&gt;</p>
+                    <p><b>Subject:</b> Project Update</p>
+                    <p>Hi Alice, I wanted to follow up on our discussion about the quarterly planning meeting. We discussed budget allocations and resource planning for Q1 2024. Please review the attached documents and let me know your thoughts.</p>
+                </div>
+            </body></html>"""
+            
+            parent = SAMPLE_PARENT.copy()
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+            parent['body_plain'] = ''  # No plain text
+            
+            records = salvage_quotes(html_text=html, parent_record=parent, conn=conn)
+            
+            assert len(records) >= 1
+            assert records[0]['source'] == 'quoted_reply'
+            assert 'From:' in records[0]['body_markdown']
+            assert len(records[0]['body_markdown']) > 100
+            conn.close()
+    
+    def test_salvage_from_html_no_quotes_returns_empty(self):
+        """Test salvage_quotes returns empty when HTML has no quote patterns."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+            
+            html = "<html><body><p>Just a simple message with no quotes.</p></body></html>"
+            
+            parent = SAMPLE_PARENT.copy()
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+            
+            records = salvage_quotes(html_text=html, parent_record=parent, conn=conn)
+            assert len(records) == 0
+            conn.close()
+    
+    def test_salvage_prefers_plain_text_over_html(self):
+        """Test that plain_text is preferred when both are available."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+            
+            plain_text = """Reply here.
+
+From: Bob <bob@example.com>
+Sent: Monday, January 15, 2024 10:30 AM
+To: Alice <alice@example.com>
+Subject: Test
+
+This is the quoted content from plain text that should be salvaged."""
+            
+            html = "<html><body><p>Different HTML content</p></body></html>"
+            
+            parent = SAMPLE_PARENT.copy()
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+            
+            records = salvage_quotes(plain_text=plain_text, html_text=html, parent_record=parent, conn=conn)
+            
+            assert len(records) >= 1
+            assert 'From: Bob' in records[0]['body_markdown']
+            conn.close()
+
+
+class TestHTMLOnlyEmailSalvage:
+    def test_insert_html_only_email_and_salvage(self):
+        """Insert an HTML-only email (empty body_plain, populated body_markdown containing 
+        an Outlook-style quoted reply) into the test DB, run salvage, assert salvaged count >= 1."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+            
+            html = """<html><body>
+                <p>Thanks for the update, looking forward to the meeting.</p>
+                <div>
+                    <p><b>From:</b> Bob Smith &lt;bob@example.com&gt;</p>
+                    <p><b>Sent:</b> Monday, January 15, 2024 10:30 AM</p>
+                    <p><b>To:</b> Alice Jones &lt;alice@example.com&gt;</p>
+                    <p><b>Subject:</b> Quarterly Planning Meeting</p>
+                    <p>Hi Alice, I wanted to follow up on our discussion about the quarterly planning meeting. We discussed budget allocations and resource planning for Q1 2024. Please review the attached documents and let me know your thoughts. I have also included some additional analysis for your review. The key points from our discussion included timeline adjustments, resource allocation changes, and new deliverables.</p>
+                </div>
+            </body></html>"""
+            
+            parent = SAMPLE_PARENT.copy()
+            parent['body_plain'] = ''
+            parent['body_markdown'] = html
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+            
+            records = salvage_quotes(
+                plain_text=parent['body_plain'],
+                html_text=html,
+                parent_record=parent,
+                conn=conn
+            )
+            
+            assert len(records) >= 1, f"Expected at least 1 salvaged record, got {len(records)}"
+            assert records[0]['source'] == 'quoted_reply'
+            assert 'From:' in records[0]['body_markdown'] or 'Sent:' in records[0]['body_markdown']
+            conn.close()
