@@ -337,6 +337,22 @@ def _compute_content_hash(text: str) -> str:
     return hashlib.sha256(_normalize_for_hash(text).encode()).hexdigest()
 
 
+def _extract_text_from_html(html_text: str) -> str:
+    """Extract text content from raw HTML while preserving structure for quote detection."""
+    if not html_text or not html_text.strip():
+        return ''
+    
+    soup = BeautifulSoup(html_text, 'html.parser')
+    
+    for element in soup(['script', 'style']):
+        element.decompose()
+    
+    text = soup.get_text(separator='\n', strip=True)
+    
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    return '\n'.join(lines)
+
+
 _OUTLOOK_QUOTE_PATTERNS = [
     re.compile(
         r'(?:^|\n\n)(From:[^\n]+\n'

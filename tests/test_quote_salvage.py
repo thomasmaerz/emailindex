@@ -272,3 +272,42 @@ This is the quoted content that should be salvaged."""
             records2 = salvage_quotes(parent['body_plain'], parent, conn)
             assert len(records2) == 0
             conn.close()
+
+
+class TestHTMLTextExtraction:
+    def test_extract_text_from_html_preserves_outlook_structure(self):
+        html = """<html><body>
+            <p>Reply to this message.</p>
+            <div>
+                <p><b>From:</b> Bob Smith &lt;bob@example.com&gt;</p>
+                <p><b>Sent:</b> Monday, January 15, 2024 10:30 AM</p>
+                <p><b>To:</b> Alice Jones &lt;alice@example.com&gt;</p>
+                <p><b>Subject:</b> Meeting Tomorrow</p>
+                <p>Hi Alice, Can we meet tomorrow at 2pm? I'd like to discuss the project timeline and deliverables. Thanks, Bob</p>
+            </div>
+        </body></html>"""
+        from ingest import _extract_text_from_html
+        text = _extract_text_from_html(html)
+        assert 'From:' in text
+        assert 'Sent:' in text
+        assert 'To:' in text
+        assert 'Subject:' in text
+        assert 'Meeting Tomorrow' in text
+        assert len(text) > 100
+    
+    def test_extract_text_from_html_empty_returns_empty(self):
+        from ingest import _extract_text_from_html
+        assert _extract_text_from_html('') == ''
+        assert _extract_text_from_html(None) == ''
+    
+    def test_extract_text_from_html_blockquote_handling(self):
+        html = """<html><body>
+            <p>My reply text here.</p>
+            <blockquote>
+                <p>This is the quoted content that should be preserved in the extraction.</p>
+            </blockquote>
+        </body></html>"""
+        from ingest import _extract_text_from_html
+        text = _extract_text_from_html(html)
+        assert 'My reply text here' in text
+        assert 'quoted content' in text
