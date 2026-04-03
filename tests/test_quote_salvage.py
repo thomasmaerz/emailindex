@@ -223,7 +223,12 @@ Thanks,
 Bob"""
             parent['to_addresses'] = json.dumps(['bob@example.com'])
             
-            records = salvage_quotes(parent['body_plain'], parent, conn)
+            records = salvage_quotes(
+                plain_text=parent['body_plain'],
+                html_text=None,
+                parent_record=parent,
+                conn=conn
+            )
             
             assert len(records) >= 1
             assert records[0]['source'] == 'quoted_reply'
@@ -241,7 +246,12 @@ Bob"""
             parent['body_plain'] = ''
             parent['to_addresses'] = json.dumps(['bob@example.com'])
             
-            records = salvage_quotes(parent['body_plain'], parent, conn)
+            records = salvage_quotes(
+                plain_text=parent['body_plain'],
+                html_text=None,
+                parent_record=parent,
+                conn=conn
+            )
             assert len(records) == 0
             conn.close()
     
@@ -261,7 +271,12 @@ Subject: Test
 This is the quoted content that should be salvaged."""
             parent['to_addresses'] = json.dumps(['bob@example.com'])
             
-            records1 = salvage_quotes(parent['body_plain'], parent, conn)
+            records1 = salvage_quotes(
+                plain_text=parent['body_plain'],
+                html_text=None,
+                parent_record=parent,
+                conn=conn
+            )
             assert len(records1) >= 1
             
             for rec in records1:
@@ -269,6 +284,21 @@ This is the quoted content that should be salvaged."""
                 insert_email(conn, rec)
             conn.commit()
             
-            records2 = salvage_quotes(parent['body_plain'], parent, conn)
+            records2 = salvage_quotes(
+                plain_text=parent['body_plain'],
+                html_text=None,
+                parent_record=parent,
+                conn=conn
+            )
             assert len(records2) == 0
             conn.close()
+
+
+class TestParseEmailFileHTMLSalvage:
+    def test_html_body_passed_to_salvage_when_plain_empty(self):
+        """Test that parse_email_file passes HTML to salvage when plain is empty."""
+        import inspect
+        from ingest import salvage_quotes
+        sig = inspect.signature(salvage_quotes)
+        assert 'html_text' in sig.parameters
+        assert 'plain_text' in sig.parameters

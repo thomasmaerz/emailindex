@@ -261,6 +261,15 @@ class Converter:
         return markdown_text
 
     @staticmethod
+    def extract_text_from_html(html_content: str) -> str:
+        if not html_content:
+            return ""
+        soup = BeautifulSoup(html_content, "html.parser")
+        for element in soup(["script", "style"]):
+            element.decompose()
+        return soup.get_text(separator=' ', strip=True)
+
+    @staticmethod
     def format_size(bytes_val: int) -> str:
         for unit in ['B', 'KB', 'MB', 'GB']:
             if bytes_val < 1024:
@@ -456,22 +465,26 @@ def _make_salvaged_record(content: str, content_hash: str, parent_record: dict) 
     }
 
 
-def salvage_quotes(plain_text: str, parent_record: dict, conn: sqlite3.Connection) -> list[dict]:
+def salvage_quotes(plain_text: str, html_text: str | None, parent_record: dict, conn: sqlite3.Connection) -> list[dict]:
     """Extract quoted fragments, deduplicate (Tier 1 + Tier 2), return salvaged records."""
-    if not plain_text or not plain_text.strip():
+    text_to_parse = plain_text
+    if (not text_to_parse or not text_to_parse.strip()) and html_text:
+        text_to_parse = Converter.extract_text_from_html(html_text)
+    
+    if not text_to_parse or not text_to_parse.strip():
         return []
     
     salvaged = []
     
     quoted_fragments = []
     try:
-        fragments = EmailReplyParser.read(plain_text)
+        fragments = EmailReplyParser.read(text_to_parse)
         quoted_fragments = [f for f in fragments.fragments if f.quoted]
     except Exception as e:
         logger.warning(f"Failed to parse email for quotes: {e}")
     
     if not quoted_fragments:
-        outlook_quotes = _extract_outlook_quotes(plain_text)
+        outlook_quotes = _extract_outlook_quotes(text_to_parse)
         for content in outlook_quotes:
             content_hash = _compute_content_hash(content)
             if _is_duplicate_by_hash(conn, content_hash):
@@ -782,8 +795,13 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
         
         # Extract quoted fragments BEFORE markdown conversion
         salvaged_records = []
-        if plain_body and db_conn:
-            salvaged_records = salvage_quotes(plain_body, parent_record, db_conn)
+        if db_conn and (plain_body or html_body):
+            salvaged_records = salvage_quotes(
+                plain_text=plain_body,
+                html_text=html_body,
+                parent_record=parent_record,
+                conn=db_conn
+            )
         
         # Convert HTML to markdown (original body stays intact with quotes)
         if html_body:
