@@ -383,3 +383,40 @@ This is the quoted content from plain text that should be salvaged."""
             assert len(records) >= 1
             assert 'From: Bob' in records[0]['body_markdown']
             conn.close()
+
+
+class TestHTMLOnlyEmailSalvage:
+    def test_insert_html_only_email_and_salvage(self):
+        """Insert an HTML-only email (empty body_plain, populated body_markdown containing 
+        an Outlook-style quoted reply) into the test DB, run salvage, assert salvaged count >= 1."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+            
+            html = """<html><body>
+                <p>Thanks for the update, looking forward to the meeting.</p>
+                <div>
+                    <p><b>From:</b> Bob Smith &lt;bob@example.com&gt;</p>
+                    <p><b>Sent:</b> Monday, January 15, 2024 10:30 AM</p>
+                    <p><b>To:</b> Alice Jones &lt;alice@example.com&gt;</p>
+                    <p><b>Subject:</b> Quarterly Planning Meeting</p>
+                    <p>Hi Alice, I wanted to follow up on our discussion about the quarterly planning meeting. We discussed budget allocations and resource planning for Q1 2024. Please review the attached documents and let me know your thoughts. I have also included some additional analysis for your review. The key points from our discussion included timeline adjustments, resource allocation changes, and new deliverables.</p>
+                </div>
+            </body></html>"""
+            
+            parent = SAMPLE_PARENT.copy()
+            parent['body_plain'] = ''
+            parent['body_markdown'] = html
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+            
+            records = salvage_quotes(
+                plain_text=parent['body_plain'],
+                html_text=html,
+                parent_record=parent,
+                conn=conn
+            )
+            
+            assert len(records) >= 1, f"Expected at least 1 salvaged record, got {len(records)}"
+            assert records[0]['source'] == 'quoted_reply'
+            assert 'From:' in records[0]['body_markdown'] or 'Sent:' in records[0]['body_markdown']
+            conn.close()
