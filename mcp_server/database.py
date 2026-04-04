@@ -304,178 +304,154 @@ def query_email_database(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     from_address: Optional[str] = None,
+    from_name: Optional[str] = None,
     to_address: Optional[str] = None,
     is_outbound: Optional[bool] = None,
     has_attachments: Optional[bool] = None,
     limit: int = 10,
-    include_full_thread: bool = False
+    include_full_thread: bool = False,
+    sort_by: Optional[str] = None,
+    sort_order: Optional[str] = None,
+    count_only: bool = False
 ) -> dict:
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     where_clauses = []
     params = []
-    
-    if semantic_query:
-        try:
-            query_embedding = _encode_text_to_embedding(semantic_query)
-            
-            vector_where = "e.embedding IS NOT NULL AND (e.source IS NULL OR e.source != 'quoted_reply')"
-            vector_params = [query_embedding]
-            
-            if is_outbound is not None:
-                vector_where += " AND e.is_outbound = ?"
-                vector_params.append(1 if is_outbound else 0)
-            
-            vector_params.append(limit * 3)
-            
-            cursor.execute(f"""
-                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address,
-                       e.from_name, e.has_attachments, e.folder, e.body_markdown,
-                       vec_distance_cosine(e.embedding, ?) as score
-                FROM emails e
-                WHERE {vector_where}
-                ORDER BY score ASC
-                LIMIT ?
-            """, vector_params)
-            
-            vector_results = cursor.fetchall()
-            
-            results = []
-            thread_ids = set()
-            for r in vector_results[:limit]:
-                results.append({
-                    "id": r["id"],
-                    "thread_id": r["thread_id"],
-                    "subject": r["subject"],
-                    "timestamp": r["timestamp"],
-                    "from_address": r["from_address"],
-                    "from_name": r["from_name"],
-                    "snippet": r["body_markdown"][:500] if r["body_markdown"] else "",
-                    "score": r["score"],
-                    "has_attachments": bool(r["has_attachments"]),
-                    "folder": r["folder"]
-                })
-                if r["thread_id"]:
-                    thread_ids.add(r["thread_id"])
-            
-            if include_full_thread and thread_ids:
-                cursor.execute("""
-                    SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address,
-                           e.from_name, e.has_attachments, e.folder, e.body_markdown
-                    FROM emails e
-                    WHERE e.thread_id IN ({})
-                      AND (e.source IS NULL OR e.source != 'quoted_reply')
-                    ORDER BY e.timestamp ASC
-                """.format(",".join(["?"] * len(thread_ids))), list(thread_ids))
-                
-                thread_emails = cursor.fetchall()
-                threads = {}
-                for te in thread_emails:
-                    tid = te["thread_id"]
-                    if tid not in threads:
-                        threads[tid] = []
-                    threads[tid].append({
-                        "id": te["id"],
-                        "subject": te["subject"],
-                        "timestamp": te["timestamp"],
-                        "from_address": te["from_address"],
-                        "from_name": te["from_name"],
-                        "snippet": te["body_markdown"][:500] if te["body_markdown"] else "",
-                    })
-                
-                close_connection()
-                return {"results": results, "threads": threads}
-            
-            close_connection()
-            return {"results": results}
-        except Exception as e:
-            close_connection()
-            raise ValueError(f"Vector search failed: {e}")
-    
+
+    # Build WHERE clauses
     if exact_keywords:
         safe_query = exact_keywords.strip()
         if safe_query:
             where_clauses.append("e.rowid IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)")
             params.append(safe_query)
-    
+
     if category_filter or project_filter:
         tags = []
         if category_filter:
             tags.extend([c.strip() for c in category_filter.split(",")])
         if project_filter:
             tags.extend([p.strip() for p in project_filter.split(",")])
-        
         if tags:
-            cat_tags = tags[:]
-            proj_tags = tags[:]
-            tag_conditions = " OR ".join(["category_tags LIKE ?" for _ in cat_tags])
-            tag_conditions += " OR " + " OR ".join(["project_tags LIKE ?" for _ in proj_tags])
+            tag_conditions = " OR ".join(["category_tags LIKE ?" for _ in tags])
+            tag_conditions += " OR " + " OR ".join(["project_tags LIKE ?" for _ in tags])
             where_clauses.append(f"({tag_conditions})")
-            params.extend([f"%{t}%" for t in cat_tags])
-            params.extend([f"%{t}%" for t in proj_tags])
-    
+            params.extend([f"%{t}%" for t in tags])
+
     if date_from:
         where_clauses.append("e.timestamp >= ?")
         params.append(date_from)
-    
     if date_to:
         where_clauses.append("e.timestamp <= ?")
         params.append(date_to)
-    
     if from_address:
         where_clauses.append("e.sender = ?")
         params.append(from_address)
-    
+    if from_name:
+        where_clauses.append("e.from_name LIKE ?")
+        params.append(f"%{from_name}%")
     if to_address:
         where_clauses.append("e.recipients LIKE ?")
         params.append(f"%{to_address}%")
-    
     if is_outbound is not None:
         where_clauses.append("e.is_outbound = ?")
         params.append(1 if is_outbound else 0)
-    
     if has_attachments is not None:
         where_clauses.append("e.has_attachments = ?")
         params.append(1 if has_attachments else 0)
-    
-    # Exclude quoted_reply by default
+
     where_clauses.append("(e.source IS NULL OR e.source != 'quoted_reply')")
-    
     where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
-    
-    sql = f"""
-        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
-               e.category_tags, e.project_tags, e.has_attachments, e.folder,
-               COALESCE(e.body_text, e.body_markdown) as body_text
-        FROM emails e
-        WHERE {where_sql}
-        ORDER BY e.timestamp DESC
-        LIMIT ?
-    """
+
+    # Handle count_only
+    if count_only:
+        cursor.execute(f"SELECT COUNT(*) as cnt FROM emails e WHERE {where_sql}", params)
+        count = cursor.fetchone()["cnt"]
+        close_connection()
+        return {"count": count}
+
+    # Determine sort order
+    use_fts_join = bool(exact_keywords)
+    if sort_by == "timestamp":
+        order = "ASC" if sort_order == "asc" else "DESC"
+        order_clause = f"ORDER BY e.timestamp {order}"
+        use_fts_join = False  # Don't need FTS join for timestamp sort
+    elif sort_by == "relevance":
+        order = "ASC" if sort_order == "asc" else "DESC"
+        if exact_keywords:
+            order_clause = f"ORDER BY fts.rank {order}"
+        else:
+            order_clause = f"ORDER BY e.timestamp {order}"
+            use_fts_join = False
+    else:
+        if exact_keywords:
+            order_clause = "ORDER BY fts.rank DESC"
+        else:
+            order_clause = "ORDER BY e.timestamp DESC"
+            use_fts_join = False
+
+    if use_fts_join:
+        sql = f"""
+            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                   e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                   COALESCE(e.body_text, e.body_markdown) as body_text, fts.rank
+            FROM emails e
+            JOIN emails_fts fts ON e.rowid = fts.rowid
+            WHERE {where_sql}
+            {order_clause}
+            LIMIT ?
+        """
+    else:
+        sql = f"""
+            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                   e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                   COALESCE(e.body_text, e.body_markdown) as body_text
+            FROM emails e
+            WHERE {where_sql}
+            {order_clause}
+            LIMIT ?
+        """
     params.append(limit)
-    
+
     cursor.execute(sql, params)
     results = cursor.fetchall()
-    
+
+    # Compute normalized relevance scores for FTS5
+    rank_values = []
+    if exact_keywords:
+        raw_ranks = []
+        for row in results:
+            try:
+                r = row["rank"]
+                raw_ranks.append(abs(r) if r is not None else 0)
+            except (IndexError, KeyError):
+                raw_ranks.append(0)
+        if raw_ranks:
+            max_rank = max(raw_ranks) if max(raw_ranks) > 0 else 1
+            rank_values = [round(1.0 - (r / max_rank), 4) if max_rank > 0 else 1.0 for r in raw_ranks]
+
     output = []
     thread_ids = set()
-    for row in results:
+    for i, row in enumerate(results):
+        relevance = rank_values[i] if i < len(rank_values) else None
         output.append({
             "id": row["id"],
             "thread_id": row["thread_id"],
             "subject": row["subject"],
             "timestamp": row["timestamp"],
             "from_address": row["from_address"],
-            "category_tags": row["category_tags"],
-            "project_tags": row["project_tags"],
+            "from_name": row["from_name"],
+            "category_tags": json.loads(row["category_tags"]) if row["category_tags"] else [],
+            "project_tags": json.loads(row["project_tags"]) if row["project_tags"] else [],
             "snippet": row["body_text"][:500] if row["body_text"] else "",
             "has_attachments": bool(row["has_attachments"]),
-            "folder": row["folder"]
+            "folder": row["folder"],
+            "relevance_score": relevance
         })
         if row["thread_id"]:
             thread_ids.add(row["thread_id"])
-    
+
     if include_full_thread and thread_ids:
         cursor.execute("""
             SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
@@ -485,7 +461,7 @@ def query_email_database(
               AND (e.source IS NULL OR e.source != 'quoted_reply')
             ORDER BY e.timestamp ASC
         """.format(",".join(["?"] * len(thread_ids))), list(thread_ids))
-        
+
         thread_emails = cursor.fetchall()
         threads = {}
         for te in thread_emails:
@@ -499,10 +475,10 @@ def query_email_database(
                 "from_address": te["from_address"],
                 "snippet": te["body_text"][:500] if te["body_text"] else "",
             })
-        
+
         close_connection()
         return {"results": output, "threads": threads}
-    
+
     close_connection()
     return {"results": output}
 
