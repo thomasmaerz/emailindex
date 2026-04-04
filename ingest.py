@@ -87,6 +87,43 @@ def classify_email(record: dict) -> list[str]:
     return sorted(list(matched_categories))
 
 
+def extract_project_tags(record: dict, db_conn: sqlite3.Connection) -> list[str]:
+    """Extract project tags by cross-referencing project_registry."""
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT name, aliases FROM project_registry")
+    projects = cursor.fetchall()
+    
+    if not projects:
+        return []
+    
+    text_to_search = f"{record.get('subject', '')} {record.get('body_markdown', '')[:2000]}".lower()
+    matched = set()
+    
+    for name, aliases_raw in projects:
+        # Check project name
+        if name.lower() in text_to_search:
+            matched.add(name)
+        
+        # Check aliases — handle both JSON array and comma-string formats
+        if aliases_raw:
+            aliases = []
+            try:
+                aliases = json.loads(aliases_raw)
+            except (json.JSONDecodeError, TypeError):
+                aliases = [a.strip() for a in aliases_raw.split(",") if a.strip()]
+            
+            for alias in aliases:
+                if alias.lower() in text_to_search:
+                    matched.add(name)
+                    break
+    
+    # Extract CR\d+ patterns
+    cr_matches = re.findall(r'CR\d+', record.get('subject', ''))
+    matched.update(cr_matches)
+    
+    return sorted(list(matched))
+
+
 class EncodingHandler:
     FALLBACK_ENCODINGS = [
         'utf-8', 'iso-8859-1', 'windows-1252', 'us-ascii',
@@ -225,6 +262,12 @@ class HeaderHandler:
             if not name and parsed[0]:
                 name = parsed[0]
         
+        # Fallback: derive from_name from email local-part when parseaddr returns empty
+        if not name and addresses:
+            local_part = addresses[0].split("@")[0]
+            name = local_part.replace(".", " ").replace("_", " ").title()
+            logger.debug(f"Derived from_name '{name}' from {addresses[0]}")
+        
         return name, addresses
 
 
@@ -247,6 +290,12 @@ class ThreadHandler:
             if outlook_tid:
                 thread_hash = hashlib.sha256(outlook_tid.encode()).hexdigest()[:16]
                 return f"thread-{thread_hash}"
+            
+            # Fallback: derive thread_id from subject_thread_key when no headers exist
+            subject_key = cls.generate_subject_thread_key(message.get('Subject', ''))
+            if subject_key and subject_key != 'no-subject':
+                subject_hash = hashlib.sha256(subject_key.encode()).hexdigest()[:16]
+                return f"thread-subj-{subject_hash}"
             return None
         
         thread_hash = hashlib.sha256(root_id.encode()).hexdigest()[:16]
@@ -677,6 +726,38 @@ def init_database(db_path: Path):
         END
     """)
     
+    # Email category/project tags FTS for tag-based filtering
+    cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS email_category_fts USING fts5(
+            category_tags,
+            project_tags,
+            content='emails'
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS emails_ai AFTER INSERT ON emails BEGIN
+            INSERT INTO email_category_fts(rowid, category_tags, project_tags) 
+            VALUES (new.rowid, new.category_tags, new.project_tags);
+        END
+    """)
+    
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS emails_ad AFTER DELETE ON emails BEGIN
+            INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags) 
+            VALUES('delete', old.rowid, old.category_tags, old.project_tags);
+        END
+    """)
+    
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS emails_au AFTER UPDATE ON emails BEGIN
+            INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags) 
+            VALUES('delete', old.rowid, old.category_tags, old.project_tags);
+            INSERT INTO email_category_fts(rowid, category_tags, project_tags) 
+            VALUES (new.rowid, new.category_tags, new.project_tags);
+        END
+    """)
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS attachment_hashes (
             sha256 TEXT PRIMARY KEY,
@@ -910,13 +991,16 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
         parent_record['sender'] = from_address
         all_recipients = to_addresses + (cc_addresses or [])
         parent_record['recipients'] = json.dumps(all_recipients)
-        parent_record['project_tags'] = '[]'
+        
+        # Extract project tags from project_registry
+        project_tags = extract_project_tags(parent_record, db_conn) if db_conn else []
+        parent_record['project_tags'] = json.dumps(project_tags)
         
         for salvaged in salvaged_records:
             salvaged['category_tags'] = json.dumps(tags)
             salvaged['sender'] = from_address
             salvaged['recipients'] = json.dumps(all_recipients)
-            salvaged['project_tags'] = '[]'
+            salvaged['project_tags'] = json.dumps(project_tags)
         
         return [parent_record] + salvaged_records
     

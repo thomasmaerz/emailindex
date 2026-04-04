@@ -85,12 +85,14 @@ def call_gemini(prompt: str, max_retries: int = BATCH_RETRIES) -> Optional[str]:
         logger.error("GEMINI_API_KEY not set")
         return None
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    client = genai.Client(api_key=api_key)
 
     for attempt in range(max_retries):
         try:
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
             if response.text:
                 return response.text
             logger.warning("Empty response from Gemini")
@@ -223,7 +225,20 @@ def classify_emails(checkpoint: dict) -> int:
 Categories: work, personal, financial, travel, newsletter, automated, meeting, misc
 Projects: {project_list}
 
-Emails:
+Examples:
+[
+  {{"id": "example-001", "subject": "Weekly Team Standup", "body": "Hi team, reminder that our weekly standup is at 10am in the main conference room. Please bring your project updates.", "sender": "manager@company.com"}},
+  {{"id": "example-002", "subject": "Credit Card Statement", "body": "Your credit card statement for March 2024 is now available. Total spending was $2,340.00. Log in to view details.", "sender": "noreply@bank.com"}},
+  {{"id": "example-003", "subject": "System Notification: Password Expiry", "body": "Your password will expire in 3 days. Please update it at https://password.company.com/reset", "sender": "it-security@company.com"}}
+]
+Output:
+[
+  {{"id": "example-001", "category_tags": "meeting,work", "project_tags": ""}},
+  {{"id": "example-002", "category_tags": "financial,automated", "project_tags": ""}},
+  {{"id": "example-003", "category_tags": "system_notification,automated", "project_tags": ""}}
+]
+
+Emails to classify:
 {json.dumps(email_batch, indent=2)}
 
 Output a JSON array with:

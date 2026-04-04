@@ -161,3 +161,6 @@ maildir/
 
 # Track AGENTS.md (override global ignore)
 !AGENTS.md
+
+# macOS
+**/.DS_Store
