@@ -770,6 +770,15 @@ def init_database(db_path: Path):
         )
     """)
     
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS project_registry (
+            name TEXT PRIMARY KEY,
+            aliases TEXT,
+            summary TEXT,
+            created_at TEXT
+        )
+    """)
+    
     try:
         cursor.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS email_vectors USING vec0(
@@ -1276,12 +1285,170 @@ def ingest_emails(maildir_path: Path, resume: bool = True):
         logger.info(f"Error types: {error_types}")
 
 
+def run_backfill(backfill_type: str = "all"):
+    """Run data backfill operations on existing database.
+    
+    Args:
+        backfill_type: "all" or specific operation (is_outbound, categories, projects, etc.)
+    """
+    from mcp_server.config import Config
+    
+    conn = sqlite3.connect(Config.DB_PATH)
+    cursor = conn.cursor()
+    
+    updated = 0
+    
+    if backfill_type in ("all", "sender"):
+        cursor.execute("""
+            UPDATE emails 
+            SET sender = from_address,
+                body_text = COALESCE(body_text, body_markdown),
+                source = COALESCE(source, 'original')
+            WHERE sender IS NULL OR sender = ''
+        """)
+        print(f"Backfilled sender/body_text for {cursor.rowcount} rows")
+        updated += cursor.rowcount
+    
+    if backfill_type in ("all", "from_name"):
+        cursor.execute("SELECT id, from_address FROM emails WHERE from_name IS NULL AND from_address IS NOT NULL")
+        rows = cursor.fetchall()
+        count = 0
+        for email_id, from_address in rows:
+            try:
+                local_part = from_address.split("@")[0]
+                derived_name = local_part.replace(".", " ").replace("_", " ").title()
+                cursor.execute("UPDATE emails SET from_name = ? WHERE id = ?", (derived_name, email_id))
+                count += 1
+            except Exception:
+                continue
+        conn.commit()
+        print(f"Backfilled from_name for {count} rows")
+        updated += count
+    
+    if backfill_type in ("all", "thread_id"):
+        import hashlib
+        cursor.execute("SELECT id, subject_thread_key FROM emails WHERE thread_id IS NULL")
+        rows = cursor.fetchall()
+        count = 0
+        for email_id, subject_key in rows:
+            try:
+                if subject_key and subject_key != 'no-subject':
+                    subject_hash = hashlib.sha256(subject_key.encode()).hexdigest()[:16]
+                    thread_id = f"thread-subj-{subject_hash}"
+                    cursor.execute("UPDATE emails SET thread_id = ? WHERE id = ?", (thread_id, email_id))
+                    count += 1
+            except Exception:
+                continue
+        conn.commit()
+        print(f"Backfilled thread_id for {count} rows")
+        updated += count
+    
+    if backfill_type in ("all", "recipients"):
+        cursor.execute("SELECT id, to_addresses, cc_addresses FROM emails WHERE recipients IS NULL OR recipients = ''")
+        rows = cursor.fetchall()
+        count = 0
+        for email_id, to_json, cc_json in rows:
+            try:
+                to = json.loads(to_json or '[]')
+                cc = json.loads(cc_json or '[]')
+                merged = list(dict.fromkeys(to + cc))
+                cursor.execute("UPDATE emails SET recipients = ? WHERE id = ?", (json.dumps(merged), email_id))
+                count += 1
+            except Exception:
+                continue
+        conn.commit()
+        print(f"Backfilled recipients for {count} rows")
+        updated += count
+    
+    if backfill_type in ("all", "is_outbound"):
+        cursor.execute("""
+            SELECT from_address FROM emails
+            WHERE from_address IS NOT NULL AND from_address != ''
+            GROUP BY from_address ORDER BY COUNT(*) DESC LIMIT 1
+        """)
+        row = cursor.fetchone()
+        if row:
+            owner = row[0]
+            cursor.execute("""
+                UPDATE emails SET is_outbound = CASE
+                    WHEN from_address = ? THEN 1 ELSE 0 END
+                WHERE is_outbound IS NULL
+            """, (owner,))
+            print(f"Backfilled is_outbound for {cursor.rowcount} rows (owner: {owner})")
+            updated += cursor.rowcount
+    
+    if backfill_type in ("all", "categories"):
+        cursor.execute("SELECT id, subject, body_markdown FROM emails WHERE category_tags IS NULL OR category_tags = ''")
+        rows = cursor.fetchall()
+        count = 0
+        for email_id, subject, body_markdown in rows:
+            tags = classify_email({"subject": subject, "body_markdown": body_markdown or ""})
+            cursor.execute("UPDATE emails SET category_tags = ? WHERE id = ?", (json.dumps(tags), email_id))
+            count += 1
+        conn.commit()
+        print(f"Backfilled category_tags for {count} rows")
+        updated += count
+    
+    if backfill_type in ("all", "projects"):
+        cursor.execute("SELECT name, aliases FROM project_registry")
+        projects = cursor.fetchall()
+        
+        if projects:
+            cursor.execute("SELECT id, subject, body_markdown FROM emails WHERE project_tags IS NULL OR project_tags = '[]' OR project_tags = ''")
+            rows = cursor.fetchall()
+            count = 0
+            for email_id, subject, body_markdown in rows:
+                text = f"{subject or ''} {(body_markdown or '')[:2000]}".lower()
+                matched = set()
+                
+                for name, aliases_raw in projects:
+                    if name.lower() in text:
+                        matched.add(name)
+                        continue
+                    if aliases_raw:
+                        try:
+                            aliases = json.loads(aliases_raw)
+                        except:
+                            aliases = [a.strip() for a in aliases_raw.split(",") if a.strip()]
+                        for alias in aliases:
+                            if alias.lower() in text:
+                                matched.add(name)
+                                break
+                
+                cr_matches = re.findall(r'CR\d+', subject or '')
+                matched.update(cr_matches)
+                
+                cursor.execute("UPDATE emails SET project_tags = ? WHERE id = ?", (json.dumps(sorted(list(matched))), email_id))
+                count += 1
+            conn.commit()
+            print(f"Backfilled project_tags for {count} rows")
+            updated += count
+        else:
+            print("No projects in registry, skipping project_tags backfill")
+    
+    conn.close()
+    print(f"\nBackfill complete: {updated} rows updated")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Ingest emails from Maildir")
-    parser.add_argument("maildir", type=Path, help="Path to Maildir directory")
+    parser = argparse.ArgumentParser(description="Ingest emails from Maildir or run backfill")
+    parser.add_argument("maildir", nargs="?", type=Path, help="Path to Maildir directory")
     parser.add_argument("--no-resume", action="store_true", help="Start fresh, don't resume from checkpoint")
+    parser.add_argument("--backfill", nargs="?", const="all", help="Run backfill on existing DB (default: all, or specify: is_outbound, categories, projects, etc.)")
     
     args = parser.parse_args()
+    
+    if args.backfill:
+        from mcp_server.config import Config
+        if args.backfill == "all":
+            run_backfill("all")
+        else:
+            run_backfill(args.backfill)
+        return
+    
+    if not args.maildir:
+        parser.print_help()
+        sys.exit(1)
     
     if not args.maildir.exists():
         logger.error(f"Maildir not found: {args.maildir}")
