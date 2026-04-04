@@ -264,3 +264,18 @@ class ContactProfileParams(BaseModel):
     email_address: Optional[str] = Field(None, description="Exact or partial match on from_address")
     limit: int = Field(default=10, ge=1, le=50, description="Representative emails to return")
     include_timeline: bool = Field(default=True, description="Include mention timeline")
+
+
+class ThreadArcParams(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    thread_id: str = Field(..., description="Thread ID from query result")
+    mode: str = Field(default="summary", description="summary or full")
+    max_messages: int = Field(default=20, ge=1, le=50)
+
+    @field_validator('mode')
+    @classmethod
+    def validate_mode(cls, v: str) -> str:
+        if v not in ("summary", "full"):
+            raise ValueError("mode must be 'summary' or 'full'")
+        return v

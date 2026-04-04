@@ -14,12 +14,12 @@ from .models import (
     EmailRecord, EmailSearchResult, ConversationThread,
     SearchParams, GetEmailParams, GetConversationParams, FindRecipientParams,
     QueryEmailParams, GetProjectContextParams, ListProjectsParams,
-    MentionTimelineParams, ContactProfileParams
+    MentionTimelineParams, ContactProfileParams, ThreadArcParams
 )
 from .database import (
     search_emails, get_email, get_conversation, find_recipient_emails,
     query_email_database, get_project_context, list_projects,
-    get_mention_timeline, get_contact_profile
+    get_mention_timeline, get_contact_profile, get_thread_arc
 )
 from .config import Config
 
@@ -36,6 +36,7 @@ class MCPServer:
             "list_projects": self.tool_list_projects,
             "get_mention_timeline": self.tool_get_mention_timeline,
             "get_contact_profile": self.tool_get_contact_profile,
+            "get_thread_arc": self.tool_get_thread_arc,
         }
     
     def _verify_schema(self):
@@ -189,6 +190,20 @@ class MCPServer:
         
         return result
     
+    def tool_get_thread_arc(self, params: dict) -> dict | None:
+        try:
+            arc_params = ThreadArcParams(**params)
+        except Exception as e:
+            return {"error": str(e)}
+        
+        result = get_thread_arc(
+            thread_id=arc_params.thread_id,
+            mode=arc_params.mode,
+            max_messages=arc_params.max_messages,
+        )
+        
+        return result
+    
     def handle_request(self, request: dict) -> dict | None:
         method = request.get("method")
         params = request.get("params", {})
@@ -231,8 +246,49 @@ class MCPServer:
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {"resources": []}
+                "result": {
+                    "resources": [
+                        {
+                            "uri": "email://{email_id}/body",
+                            "name": "Email Body",
+                            "description": "Full body text of an email. Use email_id from any query result.",
+                            "mimeType": "text/markdown"
+                        }
+                    ]
+                }
             }
+        
+        if method == "resources/read":
+            uri = params.get("uri", "")
+            try:
+                if "/body" in uri:
+                    if not uri.startswith("email://"):
+                        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Invalid email URI: {uri}"}}
+                    path_part = uri.replace("email://", "")
+                    if not path_part.endswith("/body"):
+                        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Invalid email body URI: {uri}"}}
+                    email_id = path_part.replace("/body", "")
+                    email = get_email(email_id)
+                    if email is None:
+                        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": f"Email not found: {email_id}"}}
+                    body_text = email.body_text or email.body_markdown or ""
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "contents": [
+                                {
+                                    "uri": uri,
+                                    "mimeType": "text/markdown",
+                                    "text": body_text
+                                }
+                            ]
+                        }
+                    }
+                else:
+                    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Unknown resource: {uri}"}}
+            except Exception as e:
+                return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": str(e)}}
         
         if method == "tools/list":
             return {
@@ -340,6 +396,19 @@ class MCPServer:
                                     "limit": {"type": "integer", "description": "Representative emails to return (1-50)", "default": 10},
                                     "include_timeline": {"type": "boolean", "description": "Include mention timeline", "default": True}
                                 }
+                            }
+                        },
+                        {
+                            "name": "get_thread_arc",
+                            "description": "Get a thread arc showing messages in a conversation thread with participant info",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "thread_id": {"type": "string", "description": "Thread ID from query result"},
+                                    "mode": {"type": "string", "enum": ["summary", "full"], "description": "summary or full", "default": "summary"},
+                                    "max_messages": {"type": "integer", "description": "Max messages to return (1-50)", "default": 20}
+                                },
+                                "required": ["thread_id"]
                             }
                         }
                     ]

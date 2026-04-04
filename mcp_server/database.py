@@ -900,3 +900,73 @@ def get_contact_profile(
         },
         "sample_emails": sample_emails,
     }
+
+
+def get_thread_arc(
+    thread_id: str,
+    mode: str = "summary",
+    max_messages: int = 20,
+) -> Optional[dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+               e.from_name, e.is_outbound,
+               COALESCE(e.body_text, e.body_markdown) as body_text
+        FROM emails e
+        WHERE e.thread_id = ?
+          AND (e.source IS NULL OR e.source != 'quoted_reply')
+        ORDER BY e.timestamp ASC
+        LIMIT ?
+    """, (thread_id, max_messages))
+
+    rows = cursor.fetchall()
+
+    if not rows and thread_id.startswith("thread-"):
+        subject_key = thread_id.replace("thread-", "")
+        cursor.execute("""
+            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                   e.from_name, e.is_outbound,
+                   COALESCE(e.body_text, e.body_markdown) as body_text
+            FROM emails e
+            WHERE e.subject_thread_key = ?
+              AND (e.source IS NULL OR e.source != 'quoted_reply')
+            ORDER BY e.timestamp ASC
+            LIMIT ?
+        """, (subject_key, max_messages))
+        rows = cursor.fetchall()
+
+    if not rows:
+        close_connection()
+        return None
+
+    participants = set()
+    messages = []
+    for row in rows:
+        participants.add(row["from_address"])
+        msg = {
+            "id": row["id"],
+            "timestamp": row["timestamp"],
+            "from": row["from_name"] or row["from_address"],
+            "direction": "outbound" if row["is_outbound"] else "inbound",
+        }
+        if mode == "summary":
+            msg["snippet"] = row["body_text"][:200] if row["body_text"] else ""
+        else:
+            msg["body_text"] = row["body_text"] or ""
+        messages.append(msg)
+
+    subject = rows[0]["subject"] if rows else ""
+    date_range = (rows[0]["timestamp"], rows[-1]["timestamp"]) if rows else (None, None)
+
+    close_connection()
+
+    return {
+        "thread_id": thread_id,
+        "subject": subject,
+        "message_count": len(messages),
+        "participants": sorted(participants),
+        "date_range": list(date_range),
+        "messages": messages,
+    }
