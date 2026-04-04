@@ -106,7 +106,7 @@ graph TB
 | Ingestion | `ingest.py` | Maildir parsing, embedding generation, quote salvage, storage |
 | Classification | `classify_emails.py` | Gemini-powered project discovery & email tagging |
 | Quote Salvage | `salvage_quotes.py` | Standalone re-salvage tool for already-ingested emails |
-| Migration | `migrate_v2.py` | Schema migration for v2 columns (tags, threading) |
+| Migration | `ingest.py --backfill` | Schema migration + backfill for v2 columns (tags, threading) |
 
 ---
 
@@ -247,7 +247,7 @@ python3 salvage_quotes.py
 
 ## MCP Tools
 
-The server exposes **5 tools** for AI assistants:
+The server exposes **9 tools** for AI assistants:
 
 ### `query_email_database`
 
@@ -283,11 +283,19 @@ flowchart LR
 | `date_from` | string | Start date (ISO 8601) |
 | `date_to` | string | End date (ISO 8601) |
 | `from_address` | string | Filter by sender |
+| `from_name` | string | Filter by sender display name (LIKE match) |
 | `to_address` | string | Filter by recipient |
 | `is_outbound` | boolean | Filter by direction |
 | `has_attachments` | boolean | Filter by attachments |
 | `limit` | integer | Max results (1-50, default: 10) |
 | `include_full_thread` | boolean | Return full conversation thread |
+| `sort_by` | string | Sort by `timestamp` or `relevance`. Auto-defaults based on query type. |
+| `sort_order` | string | Sort order `asc` or `desc`. Default: `desc`. |
+| `count_only` | boolean | Return only count, no results |
+| `fields` | array | Specific fields to return (field projection) |
+| `snippet_only` | boolean | Return FTS5 snippet instead of full body |
+| `snippet_length` | integer | FTS5 snippet token window size (default: 32) |
+| `cursor` | string | Opaque pagination cursor from previous response |
 
 **Example:**
 ```python
@@ -301,6 +309,22 @@ query_email_database(
     date_to="2024-12-31",
     has_attachments=True
 )
+
+# Cursor pagination
+results = query_email_database(exact_keywords="report", limit=20)
+next_cursor = results.get("next_cursor")
+if next_cursor:
+    page2 = query_email_database(exact_keywords="report", limit=20, cursor=next_cursor)
+
+# Field projection (return only specific fields)
+query_email_database(exact_keywords="budget", fields=["id", "subject", "timestamp", "from_address"])
+
+# Count only (no results)
+query_email_database(category_filter="work", count_only=True)
+# Returns: {"count": 142}
+
+# FTS5 snippets only (lighter response)
+query_email_database(exact_keywords="meeting", snippet_only=True, snippet_length=64)
 ```
 
 ### `get_project_context`
@@ -367,6 +391,169 @@ List all projects in the registry. Use to discover available projects before fil
 ```python
 list_projects()
 # Returns: { "projects": [...], "count": N }
+```
+
+### `get_mention_timeline`
+
+Get a timeline of keyword mentions grouped by year, month, or quarter. Useful for tracking when topics or people were discussed over time.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `keyword` | string | Exact keyword or name to search (required) |
+| `semantic_query` | string | Optional semantic variant for vector search |
+| `granularity` | string | Grouping: `year`, `month`, or `quarter` (default: `year`) |
+| `date_from` | string | Start date (ISO 8601) |
+| `date_to` | string | End date (ISO 8601) |
+| `from_address` | string | Filter by sender |
+| `is_outbound` | boolean | Filter by direction |
+
+**Example:**
+```python
+# Track mentions of "budget" by month in 2024
+get_mention_timeline(keyword="budget", granularity="month", date_from="2024-01-01", date_to="2024-12-31")
+# Returns: { "timeline": [{"period": "2024-01", "count": 5}, ...] }
+```
+
+### `get_contact_profile`
+
+Get a contact profile with interaction history, statistics, and sample emails. Identifies contacts by name or email address.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `name` | string | Fuzzy match on sender display name |
+| `email_address` | string | Exact or partial match on sender email |
+| `limit` | integer | Representative emails to return (1-50, default: 10) |
+| `include_timeline` | boolean | Include mention timeline (default: `true`) |
+
+**Example:**
+```python
+# Profile by email
+get_contact_profile(email_address="alice@company.com", limit=5)
+# Returns: { "contact": { "name", "email", "total_emails", "first_seen", "last_seen", ... }, "emails": [...], "timeline": [...] }
+
+# Profile by name (fuzzy)
+get_contact_profile(name="Alice Smith")
+```
+
+### `get_thread_arc`
+
+Get a thread arc showing messages in a conversation with participant info. Two modes: `summary` (lightweight overview) or `full` (detailed message list).
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `thread_id` | string | Thread ID from query result (required) |
+| `mode` | string | `summary` or `full` (default: `summary`) |
+| `max_messages` | integer | Max messages to return (1-50, default: 20) |
+
+**Example:**
+```python
+# Quick thread overview
+get_thread_arc(thread_id="thread-abc123", mode="summary")
+# Returns: { "thread_id", "subject", "participants": [...], "message_count", "date_range", "overview": "..." }
+
+# Full message list
+get_thread_arc(thread_id="thread-abc123", mode="full", max_messages=10)
+# Returns: { "thread_id", "messages": [{ "id", "from", "timestamp", "subject", "snippet" }, ...] }
+```
+
+### `list_threads`
+
+List all conversation threads sorted by various metrics. Useful for discovering the most active or largest threads.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `sort_by` | string | Sort field: `message_count`, `participant_count`, `last_activity`, `first_activity` (default: `message_count`) |
+| `sort_order` | string | Sort order: `asc` or `desc` (default: `desc`) |
+| `limit` | integer | Max threads to return (1-50, default: 10) |
+
+**Example:**
+```python
+# Most active threads
+list_threads(sort_by="message_count", sort_order="desc", limit=10)
+
+# Most recently active threads
+list_threads(sort_by="last_activity", limit=5)
+# Returns: { "threads": [{ "thread_id", "subject", "message_count", "participant_count", ... }], "count": N }
+```
+
+---
+
+## MCP Resources
+
+The server exposes email bodies as MCP Resources for direct access without loading full email records.
+
+### `email://{email_id}/body`
+
+Returns the full body text of an email as `text/markdown`. Use the `email_id` from any query result.
+
+```mermaid
+sequenceDiagram
+    participant AI as AI Assistant
+    participant MCP as MCP Server
+    participant DB as database.py
+    participant SQLite as SQLite
+
+    AI->>MCP: resources/read: email://{id}/body
+    MCP->>DB: get_email(email_id)
+    DB->>SQLite: SELECT body_text, body_markdown WHERE id = ?
+    SQLite-->>DB: EmailRecord
+    DB-->>MCP: EmailRecord
+    MCP->>MCP: Use body_text or body_markdown
+    MCP-->>AI: { contents: [{ text: "Full body..." }] }
+```
+
+**Example:**
+```
+# Request
+resources/read: { "uri": "email://550e8400-e29b-41d4-a716-446655440000/body" }
+
+# Response
+{ "contents": [{ "uri": "email://.../body", "mimeType": "text/markdown", "text": "Full email body text..." }] }
+```
+
+This is more efficient than `get_email_by_id` when you only need the body text.
+
+### Unified Query Flow
+
+```mermaid
+flowchart TD
+    A[query_email_database] --> B{semantic_query?}
+    B -->|yes| C[Generate embedding]
+    C --> D[vec_distance_cosine ORDER BY score]
+    D --> E{cursor?}
+    
+    B -->|no| F{exact_keywords?}
+    F -->|yes| G[FTS5 MATCH]
+    G --> E
+    F -->|no| H{category/project filter?}
+    H -->|yes| I[Tag-based LIKE filter]
+    I --> E
+    H -->|no| J[Metadata filters]
+    J --> E
+    
+    E -->|yes| K[Keyset pagination from cursor]
+    E -->|no| L[Standard offset]
+    K --> M{count_only?}
+    L --> M
+    
+    M -->|yes| N[{ count: N }]
+    M -->|no| O{fields?}
+    O -->|yes| P[Field projection]
+    O -->|no| Q[Default fields]
+    P --> R{snippet_only?}
+    Q --> R
+    R -->|yes| S[FTS5 snippet]
+    R -->|no| T[Full body_markdown]
+    S --> U[{ results: [...], next_cursor }]
+    T --> U
 ```
 
 ---
@@ -502,7 +689,7 @@ erDiagram
 |------|---------|
 | `salvage_quotes.py` | Re-salvage quoted replies from already-ingested emails (e.g., after improving the salvage algorithm) |
 | `classify_emails.py` | Run AI-powered project discovery and email tagging (requires `GEMINI_API_KEY`) |
-| `migrate_v2.py` | Apply schema migrations for v2 columns (tags, threading, sender normalization) |
+| `ingest.py --backfill` | Apply schema migrations and backfill missing data (replaces `migrate_v2.py`) |
 
 ---
 
@@ -514,6 +701,15 @@ The project includes both integration validation scripts and pytest-based unit t
 
 ```bash
 pytest tests/test_quote_salvage.py -v
+pytest tests/test_mcp_tools.py -v
+pytest tests/test_thread_arc.py -v
+pytest tests/test_contact_profile.py -v
+pytest tests/test_cursor_pagination.py -v
+pytest tests/test_field_projection.py -v
+pytest tests/test_mention_timeline.py -v
+pytest tests/test_query_extensions.py -v
+pytest tests/test_blob_exclusion.py -v
+pytest tests/test_classify_pagination.py -v
 ```
 
 Covers:
@@ -522,6 +718,13 @@ Covers:
 - Tier 1 (hash) deduplication
 - Tier 2 (semantic similarity) deduplication
 - HTML-only email salvage
+- MCP tool responses and schema validation
+- Thread arc summary/full modes
+- Contact profile aggregation
+- Cursor-based pagination
+- Field projection and response optimization
+- Blob exclusion (raw_eml, embedding not leaked)
+- Classification pagination
 - End-to-end integration
 
 ### Integration Validation
@@ -557,12 +760,10 @@ Validates:
 
 **Symptom:** Server exits with "Missing required v2 columns"
 
-**Solution:** Run the migration:
+**Solution:** Run the backfill:
 ```bash
-python3 migrate_v2.py
+python3 ingest.py /path/to/maildir --backfill
 ```
-
-The server validates the schema on startup and will fail fast with a clear error message if v2 columns are missing.
 
 ### sqlite-vec Issues
 

@@ -19,6 +19,9 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from tests.cleanup import cleanup_orphaned_attachments
+
 
 def get_db_path() -> Path:
     base = Path(__file__).parent.parent
@@ -318,8 +321,16 @@ def main():
     parser.add_argument('--has-attachments-fix', action='store_true',
                         help='Show expected state after fixes are applied')
     parser.add_argument('--cleanup', action='store_true',
-                        help='Remove orphaned files from attachments/ directory')
+                        help='Remove orphaned files from attachments/ directory (manual)')
+    parser.add_argument('--auto-cleanup', action='store_true',
+                        help='Automatically remove orphaned files during validation')
     args = parser.parse_args()
+
+    if args.auto_cleanup:
+        print("\n[Auto-cleanup] Removing orphaned attachment files...")
+        removed, freed = cleanup_orphaned_attachments(dry_run=False)
+        freed_mb = freed / (1024 * 1024)
+        print(f"[Auto-cleanup] Removed {removed} orphaned files ({freed_mb:.1f} MB freed)")
 
     result = validate(has_attachments_fix=args.has_attachments_fix, cleanup=args.cleanup)
     sys.exit(0 if result else 1)

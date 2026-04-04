@@ -751,8 +751,20 @@ def main():
         sys.exit(1)
     
     if not MAILDIR.exists():
-        print(f"ERROR: Maildir not found: {MAILDIR}")
-        sys.exit(1)
+        print(f"SKIP (maildir/cur/ not found)")
+        print("=" * 60)
+        print("  Result: SKIP")
+        print("=" * 60)
+        sys.exit(0)
+    
+    # Check if maildir is empty
+    maildir_files = [f for f in MAILDIR.iterdir() if f.is_file() and not f.name.startswith('.')]
+    if not maildir_files:
+        print(f"SKIP (maildir/cur/ is empty)")
+        print("=" * 60)
+        print("  Result: SKIP")
+        print("=" * 60)
+        sys.exit(0)
     
     results = run_validation(sample_size=args.sample, verbose=args.verbose)
     

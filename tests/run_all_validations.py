@@ -12,6 +12,7 @@ Usage:
     python tests/run_all_validations.py --verbose # detailed output
     python tests/run_all_validations.py --json    # machine-readable
     python tests/run_all_validations.py --filter extraction  # run specific test
+    python tests/run_all_validations.py --cleanup           # run cleanup then validations
 """
 
 import argparse
@@ -29,11 +30,35 @@ LOG_DIR = BASE_DIR / "ingestion" / "logs"
 MAILDIR = BASE_DIR / "maildir" / "cur"
 DB_PATH = BASE_DIR / "db" / "emails.db"
 
+sys.path.insert(0, str(BASE_DIR / "tests"))
+from cleanup import cleanup_old_logs, cleanup_log_dir_size_cap, run_all_cleanup
+
 
 def get_log_path() -> Path:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return LOG_DIR / f"validation_{timestamp}.log"
+
+
+def run_cleanup(verbose: bool = False) -> dict:
+    """Run cleanup tasks and return results summary."""
+    if verbose:
+        print("\n[Cleanup] Running cleanup tasks...", file=sys.stderr)
+
+    result = run_all_cleanup(days=7, dry_run=False)
+
+    if verbose:
+        total_mb = result["total_freed_bytes"] / (1024 * 1024)
+        print(f"[Cleanup] Removed {result['logs_removed_by_age'] + result['logs_removed_by_cap']} log files", file=sys.stderr)
+        print(f"[Cleanup] Removed {result['attachments_removed']} orphaned attachments", file=sys.stderr)
+        print(f"[Cleanup] Removed {result['dbs_removed']} stray DB files", file=sys.stderr)
+        if result["worktree_dbs"]:
+            print("[Cleanup] Worktree databases (preserved):", file=sys.stderr)
+            for wt in result["worktree_dbs"]:
+                print(f"  {wt}", file=sys.stderr)
+        print(f"[Cleanup] Total freed: {total_mb:.1f} MB", file=sys.stderr)
+
+    return result
 
 
 def run_validation_script(script_name: str, verbose: bool = False) -> tuple[bool, str, dict]:
@@ -83,6 +108,10 @@ def run_vector_validation(verbose: bool = False) -> tuple[bool, str, dict]:
 
 def run_body_text_validation(verbose: bool = False) -> tuple[bool, str, dict]:
     return run_validation_script("validate_body_text.py", verbose)
+
+
+def run_mcp_tools_validation(verbose: bool = False) -> tuple[bool, str, dict]:
+    return run_validation_script("test_mcp_tools.py", verbose)
 
 
 def format_summary(results: dict, verbose: bool = False) -> str:
@@ -186,20 +215,27 @@ def run_all_validations(
     log: bool = True
 ) -> dict:
     results = {}
-    
+    skipped = {}  # Track skipped checks and reasons
+
     prereq_error = check_prerequisites()
     if prereq_error:
         return {
             "Extraction Pipeline": {"status": "ERROR", "details": prereq_error, "output": ""},
             "Attachment Pipeline": {"status": "ERROR", "details": prereq_error, "output": ""},
-            "Vector Pipeline": {"status": "ERROR", "details": prereq_error, "output": ""}
+            "Vector Pipeline": {"status": "ERROR", "details": prereq_error, "output": ""},
+            "Body Text Pipeline": {"status": "ERROR", "details": prereq_error, "output": ""},
+            "MCP Tools": {"status": "ERROR", "details": prereq_error, "output": ""}
         }
+    
+    # Track if maildir is empty/missing for skip reporting
+    maildir_empty = not MAILDIR.exists() or not any(f for f in MAILDIR.iterdir() if not f.name.startswith('.'))
     
     phases = [
         ("Extraction Pipeline", lambda: run_extraction_validation(verbose)),
         ("Attachment Pipeline", lambda: run_attachments_validation(verbose)),
         ("Vector Pipeline", lambda: run_vector_validation(verbose)),
-        ("Body Text Pipeline", lambda: run_body_text_validation(verbose))
+        ("Body Text Pipeline", lambda: run_body_text_validation(verbose)),
+        ("MCP Tools", lambda: run_mcp_tools_validation(verbose))
     ]
     
     if filter_by:
@@ -216,6 +252,11 @@ def run_all_validations(
             "details": detail.get("returncode", 0) if not passed else "OK",
             "output": output
         }
+
+        # Check for SKIP in output
+        if "SKIP" in output or (maildir_empty and "maildir" in output.lower()):
+            skip_reason = "maildir not found" if maildir_empty else "check skipped"
+            skipped[phase_name] = skip_reason
     
     return results
 
@@ -226,7 +267,15 @@ def main():
     parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     parser.add_argument("--no-log", action="store_true", help="Don't write log file")
     parser.add_argument("--filter", "-f", type=str, help="Run only specific test (extraction, attachments, vector)")
+    parser.add_argument("--cleanup", action="store_true", help="Run cleanup tasks before validation")
     args = parser.parse_args()
+    
+    # Run cleanup first if requested
+    skip_summary = {}
+    if args.cleanup:
+        cleanup_result = run_cleanup(verbose=args.verbose)
+        total_mb = cleanup_result["total_freed_bytes"] / (1024 * 1024)
+        print(f"\n[Cleanup] Freed {total_mb:.1f} MB total\n")
     
     results = run_all_validations(
         filter_by=args.filter,
@@ -242,6 +291,13 @@ def main():
         
         if args.verbose:
             print(format_verbose_output(results))
+        
+        # Print skip summary if any checks were skipped
+        maildir_empty = not MAILDIR.exists() or not any(f for f in MAILDIR.iterdir() if not f.name.startswith('.'))
+        if maildir_empty:
+            skipped_count = sum(1 for r in results.values() if "maildir" in r.get("output", "").lower() or "skip" in r.get("status", "").lower())
+            if skipped_count > 0:
+                print(f"\n⚠️  {skipped_count} checks skipped due to missing maildir")
     
     if not args.no_log:
         log_path = get_log_path()

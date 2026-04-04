@@ -350,8 +350,14 @@ def check_pipeline_integrity() -> tuple[bool, str, dict]:
     """Check maildir count matches DB count matches vector count."""
     import os
     
-    maildir_cur = MAILDIR
-    maildir_count = len([f for f in os.listdir(maildir_cur) if f and not f.startswith('.')])
+    if not MAILDIR.exists():
+        return True, "SKIP (maildir/cur/ not found)", {"maildir_count": 0, "db_count": 0, "vector_count": 0}
+    
+    maildir_files = [f for f in MAILDIR.iterdir() if f.is_file() and not f.name.startswith('.')]
+    if not maildir_files:
+        return True, "SKIP (maildir/cur/ is empty)", {"maildir_count": 0, "db_count": 0, "vector_count": 0}
+    
+    maildir_count = len(maildir_files)
     
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()

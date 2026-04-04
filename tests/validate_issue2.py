@@ -143,8 +143,25 @@ def classify_email(eml_info, db_record):
 def run_validation(sample_size=None, verbose=False):
     """Main validation logic."""
     if not MAILDIR.exists():
-        print("ERROR: Maildir not found: {}".format(MAILDIR))
-        sys.exit(1)
+        print("=" * 60)
+        print("  Issue #2 Validation Report")
+        print("=" * 60)
+        print("\nSKIP (maildir/cur/ not found)")
+        print("=" * 60)
+        print("  Result: SKIP")
+        print("=" * 60)
+        sys.exit(0)
+
+    maildir_files = [f for f in MAILDIR.iterdir() if f.is_file() and not f.name.startswith('.')]
+    if not maildir_files:
+        print("=" * 60)
+        print("  Issue #2 Validation Report")
+        print("=" * 60)
+        print("\nSKIP (maildir/cur/ is empty)")
+        print("=" * 60)
+        print("  Result: SKIP")
+        print("=" * 60)
+        sys.exit(0)
 
     if not DB_PATH.exists():
         print("ERROR: Database not found: {}".format(DB_PATH))
