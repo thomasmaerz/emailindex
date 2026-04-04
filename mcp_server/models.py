@@ -255,3 +255,12 @@ class MentionTimelineParams(BaseModel):
         if v not in ("year", "month", "quarter"):
             raise ValueError("granularity must be 'year', 'month', or 'quarter'")
         return v
+
+
+class ContactProfileParams(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    name: Optional[str] = Field(None, description="Fuzzy match on from_name")
+    email_address: Optional[str] = Field(None, description="Exact or partial match on from_address")
+    limit: int = Field(default=10, ge=1, le=50, description="Representative emails to return")
+    include_timeline: bool = Field(default=True, description="Include mention timeline")

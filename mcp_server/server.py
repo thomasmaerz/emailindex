@@ -14,12 +14,12 @@ from .models import (
     EmailRecord, EmailSearchResult, ConversationThread,
     SearchParams, GetEmailParams, GetConversationParams, FindRecipientParams,
     QueryEmailParams, GetProjectContextParams, ListProjectsParams,
-    MentionTimelineParams
+    MentionTimelineParams, ContactProfileParams
 )
 from .database import (
     search_emails, get_email, get_conversation, find_recipient_emails,
     query_email_database, get_project_context, list_projects,
-    get_mention_timeline
+    get_mention_timeline, get_contact_profile
 )
 from .config import Config
 
@@ -35,6 +35,7 @@ class MCPServer:
             "get_thread_by_id": self.tool_get_thread_by_id,
             "list_projects": self.tool_list_projects,
             "get_mention_timeline": self.tool_get_mention_timeline,
+            "get_contact_profile": self.tool_get_contact_profile,
         }
     
     def _verify_schema(self):
@@ -169,6 +170,21 @@ class MCPServer:
             date_to=timeline_params.date_to,
             from_address=timeline_params.from_address,
             is_outbound=timeline_params.is_outbound,
+        )
+        
+        return result
+    
+    def tool_get_contact_profile(self, params: dict) -> dict | None:
+        try:
+            contact_params = ContactProfileParams(**params)
+        except Exception as e:
+            return {"error": str(e)}
+        
+        result = get_contact_profile(
+            name=contact_params.name,
+            email_address=contact_params.email_address,
+            limit=contact_params.limit,
+            include_timeline=contact_params.include_timeline,
         )
         
         return result
@@ -311,6 +327,19 @@ class MCPServer:
                                     "is_outbound": {"type": "boolean", "description": "Filter by direction"}
                                 },
                                 "required": ["keyword"]
+                            }
+                        },
+                        {
+                            "name": "get_contact_profile",
+                            "description": "Get a contact profile with interaction history and sample emails",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string", "description": "Fuzzy match on from_name"},
+                                    "email_address": {"type": "string", "description": "Exact or partial match on from_address"},
+                                    "limit": {"type": "integer", "description": "Representative emails to return (1-50)", "default": 10},
+                                    "include_timeline": {"type": "boolean", "description": "Include mention timeline", "default": True}
+                                }
                             }
                         }
                     ]

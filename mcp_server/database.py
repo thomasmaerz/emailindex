@@ -808,3 +808,95 @@ def get_mention_timeline(
         "last_occurrence": bounds["last"] if bounds else None,
         "timeline": timeline
     }
+
+
+def get_contact_profile(
+    name: Optional[str] = None,
+    email_address: Optional[str] = None,
+    limit: int = 10,
+    include_timeline: bool = True,
+) -> Optional[dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    where_clauses = []
+    params = []
+
+    if name:
+        where_clauses.append("e.from_name LIKE ?")
+        params.append(f"%{name}%")
+    if email_address:
+        where_clauses.append("(e.sender LIKE ? OR e.recipients LIKE ?)")
+        params.extend([f"%{email_address}%", f"%{email_address}%"])
+
+    if not where_clauses:
+        close_connection()
+        return None
+
+    where_clauses.append("(e.source IS NULL OR e.source != 'quoted_reply')")
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as total_sent_to_you,
+               MIN(e.timestamp) as first_interaction,
+               MAX(e.timestamp) as last_interaction
+        FROM emails e WHERE {where_sql}
+    """, params)
+    stats = cursor.fetchone()
+
+    if stats["total_sent_to_you"] == 0:
+        close_connection()
+        return None
+
+    cursor.execute(f"""
+        SELECT DISTINCT e.sender as address FROM emails e WHERE {where_sql}
+    """, params)
+    addresses = [row["address"] for row in cursor.fetchall()]
+
+    cursor.execute(f"""
+        SELECT e.from_name FROM emails e WHERE {where_sql} AND e.from_name IS NOT NULL LIMIT 1
+    """, params)
+    name_row = cursor.fetchone()
+    display_name = name_row["from_name"] if name_row else ""
+
+    timeline = {}
+    if include_timeline:
+        cursor.execute(f"""
+            SELECT strftime('%Y', e.timestamp) as year, COUNT(*) as count
+            FROM emails e WHERE {where_sql} GROUP BY year ORDER BY year
+        """, params)
+        for row in cursor.fetchall():
+            timeline[row["year"]] = row["count"]
+
+    cursor.execute(f"""
+        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+               e.from_name, e.has_attachments, e.folder,
+               COALESCE(e.body_text, e.body_markdown) as body_text, e.is_outbound
+        FROM emails e WHERE {where_sql} ORDER BY e.timestamp DESC LIMIT ?
+    """, params + [limit])
+
+    sample_emails = []
+    for row in cursor.fetchall():
+        sample_emails.append({
+            "id": row["id"],
+            "thread_id": row["thread_id"],
+            "subject": row["subject"],
+            "timestamp": row["timestamp"],
+            "from_address": row["from_address"],
+            "snippet": row["body_text"][:300] if row["body_text"] else "",
+            "is_outbound": bool(row["is_outbound"]),
+        })
+
+    close_connection()
+
+    return {
+        "contact": {
+            "display_name": display_name,
+            "known_addresses": addresses,
+            "total_sent_to_you": stats["total_sent_to_you"],
+            "first_interaction": stats["first_interaction"],
+            "last_interaction": stats["last_interaction"],
+            "timeline_by_year": timeline,
+        },
+        "sample_emails": sample_emails,
+    }
