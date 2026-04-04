@@ -191,7 +191,15 @@ def get_email(email_id: str) -> Optional[EmailRecord]:
     conn = get_connection()
     cursor = conn.cursor()
     
-    cursor.execute("SELECT * FROM emails WHERE id = ?", (email_id,))
+    # Explicitly exclude raw_eml and embedding — these must never appear in MCP responses
+    cursor.execute("""
+        SELECT id, message_id, thread_id, subject_thread_key, timestamp,
+               from_address, from_name, to_addresses, cc_addresses, subject,
+               body_markdown, body_plain, x_mailer, has_attachments, attachments,
+               folder, source, parent_id, content_hash, sender, recipients,
+               body_text, category_tags, project_tags, is_outbound
+        FROM emails WHERE id = ?
+    """, (email_id,))
     row = cursor.fetchone()
     close_connection()
     
@@ -199,12 +207,7 @@ def get_email(email_id: str) -> Optional[EmailRecord]:
         return None
     
     row_dict = dict(row)
-    
-    if row_dict.get('raw_eml'):
-        try:
-            row_dict['raw_eml'] = bytes(row_dict['raw_eml'])
-        except Exception:
-            row_dict['raw_eml'] = None
+    row_dict['raw_eml'] = None  # permanently excluded from API responses
     
     return EmailRecord.from_db_row(row_dict)
 

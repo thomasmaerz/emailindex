@@ -1,0 +1,77 @@
+import sys, tempfile, sqlite3, os
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from mcp_server.database import get_email
+from mcp_server.config import Config
+
+def create_test_db():
+    fd, path = tempfile.mkstemp(suffix='.db')
+    os.close(fd)
+    conn = sqlite3.connect(path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE emails (
+            id TEXT PRIMARY KEY, message_id TEXT UNIQUE NOT NULL,
+            thread_id TEXT, subject_thread_key TEXT, timestamp TEXT NOT NULL,
+            from_address TEXT NOT NULL, from_name TEXT, to_addresses TEXT NOT NULL,
+            cc_addresses TEXT, subject TEXT NOT NULL, body_markdown TEXT NOT NULL,
+            body_plain TEXT, x_mailer TEXT, has_attachments INTEGER NOT NULL DEFAULT 0,
+            attachments TEXT, folder TEXT NOT NULL, raw_eml BLOB,
+            source TEXT DEFAULT 'original', parent_id TEXT, content_hash TEXT,
+            sender TEXT, recipients TEXT, body_text TEXT,
+            category_tags TEXT, project_tags TEXT, is_outbound INTEGER,
+            embedding BLOB
+        )
+    """)
+    cursor.execute("""
+        INSERT INTO emails (id, message_id, timestamp, from_address, from_name,
+            to_addresses, subject, body_markdown, body_text, folder, sender, recipients, subject_thread_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "550e8400-e29b-41d4-a716-446655440000", "<test@example.com>",
+        "2024-01-15T10:00:00Z", "alice@example.com", "Alice",
+        '["bob@example.com"]', "Test", "Test body", "Test body",
+        "INBOX", "alice@example.com", '["bob@example.com"]', "test"
+    ))
+    conn.commit()
+    conn.close()
+    return path
+
+def test_get_email_excludes_raw_eml():
+    path = create_test_db()
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute("UPDATE emails SET raw_eml = X'DEADBEEF' WHERE id = '550e8400-e29b-41d4-a716-446655440000'")
+        conn.commit()
+        conn.close()
+
+        original_db = Config.DB_PATH
+        Config.DB_PATH = Path(path)
+
+        result = get_email("550e8400-e29b-41d4-a716-446655440000")
+        assert result.raw_eml is None, f"raw_eml should be None, got {type(result.raw_eml)}"
+        print("✓ test_get_email_excludes_raw_eml passed")
+    finally:
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+def test_get_email_excludes_embedding():
+    path = create_test_db()
+    try:
+        original_db = Config.DB_PATH
+        Config.DB_PATH = Path(path)
+
+        result = get_email("550e8400-e29b-41d4-a716-446655440000")
+        dumped = result.model_dump(mode='json')
+        assert "embedding" not in dumped, f"embedding should not be in response, got keys: {dumped.keys()}"
+        print("✓ test_get_email_excludes_embedding passed")
+    finally:
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+if __name__ == "__main__":
+    test_get_email_excludes_raw_eml()
+    test_get_email_excludes_embedding()
+    print("\n✅ All blob exclusion tests passed!")
