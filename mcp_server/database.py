@@ -736,3 +736,75 @@ def list_projects(limit: int = 20) -> list[dict]:
     
     close_connection()
     return results
+
+
+def get_mention_timeline(
+    keyword: str,
+    semantic_query: Optional[str] = None,
+    granularity: str = "year",
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    from_address: Optional[str] = None,
+    is_outbound: Optional[bool] = None,
+) -> dict:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["e.rowid IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)"]
+    params = [keyword]
+
+    if date_from:
+        where_clauses.append("e.timestamp >= ?")
+        params.append(date_from)
+    if date_to:
+        where_clauses.append("e.timestamp <= ?")
+        params.append(date_to)
+    if from_address:
+        where_clauses.append("e.sender = ?")
+        params.append(from_address)
+    if is_outbound is not None:
+        where_clauses.append("e.is_outbound = ?")
+        params.append(1 if is_outbound else 0)
+
+    where_clauses.append("(e.source IS NULL OR e.source != 'quoted_reply')")
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"SELECT COUNT(*) as cnt FROM emails e WHERE {where_sql}", params)
+    total = cursor.fetchone()["cnt"]
+
+    cursor.execute(f"""
+        SELECT MIN(e.timestamp) as first, MAX(e.timestamp) as last
+        FROM emails e WHERE {where_sql}
+    """, params)
+    bounds = cursor.fetchone()
+
+    if granularity == "year":
+        period_expr = "strftime('%Y', e.timestamp)"
+    elif granularity == "month":
+        period_expr = "strftime('%Y-%m', e.timestamp)"
+    elif granularity == "quarter":
+        period_expr = "strftime('%Y-', e.timestamp) || ((CAST(strftime('%m', e.timestamp) AS INTEGER) - 1) / 3 + 1)"
+    else:
+        period_expr = "strftime('%Y', e.timestamp)"
+
+    cursor.execute(f"""
+        SELECT {period_expr} as period, COUNT(*) as count
+        FROM emails e
+        WHERE {where_sql}
+        GROUP BY period
+        ORDER BY period
+    """, params)
+
+    timeline = {}
+    for row in cursor.fetchall():
+        timeline[row["period"]] = row["count"]
+
+    close_connection()
+
+    return {
+        "keyword": keyword,
+        "total_matches": total,
+        "first_occurrence": bounds["first"] if bounds else None,
+        "last_occurrence": bounds["last"] if bounds else None,
+        "timeline": timeline
+    }

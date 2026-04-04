@@ -236,3 +236,22 @@ class ListProjectsParams(BaseModel):
     model_config = ConfigDict(strict=True)
     
     limit: int = Field(20, ge=1, le=50, description="Max projects to return")
+
+
+class MentionTimelineParams(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    keyword: str = Field(..., description="Exact keyword or name to search")
+    semantic_query: Optional[str] = Field(None, description="Optional semantic variant")
+    granularity: str = Field(default="year", description="year, month, or quarter")
+    date_from: Optional[str] = Field(None, description="Start date ISO 8601")
+    date_to: Optional[str] = Field(None, description="End date ISO 8601")
+    from_address: Optional[str] = Field(None, description="Filter by sender")
+    is_outbound: Optional[bool] = Field(None, description="Filter by direction")
+
+    @field_validator('granularity')
+    @classmethod
+    def validate_granularity(cls, v: str) -> str:
+        if v not in ("year", "month", "quarter"):
+            raise ValueError("granularity must be 'year', 'month', or 'quarter'")
+        return v

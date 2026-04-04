@@ -13,11 +13,13 @@ import sqlite3
 from .models import (
     EmailRecord, EmailSearchResult, ConversationThread,
     SearchParams, GetEmailParams, GetConversationParams, FindRecipientParams,
-    QueryEmailParams, GetProjectContextParams, ListProjectsParams
+    QueryEmailParams, GetProjectContextParams, ListProjectsParams,
+    MentionTimelineParams
 )
 from .database import (
     search_emails, get_email, get_conversation, find_recipient_emails,
-    query_email_database, get_project_context, list_projects
+    query_email_database, get_project_context, list_projects,
+    get_mention_timeline
 )
 from .config import Config
 
@@ -32,6 +34,7 @@ class MCPServer:
             "get_email_by_id": self.tool_get_email_by_id,
             "get_thread_by_id": self.tool_get_thread_by_id,
             "list_projects": self.tool_list_projects,
+            "get_mention_timeline": self.tool_get_mention_timeline,
         }
     
     def _verify_schema(self):
@@ -151,6 +154,24 @@ class MCPServer:
             "projects": results,
             "count": len(results)
         }
+    
+    def tool_get_mention_timeline(self, params: dict) -> dict:
+        try:
+            timeline_params = MentionTimelineParams(**params)
+        except Exception as e:
+            return {"error": str(e)}
+        
+        result = get_mention_timeline(
+            keyword=timeline_params.keyword,
+            semantic_query=timeline_params.semantic_query,
+            granularity=timeline_params.granularity,
+            date_from=timeline_params.date_from,
+            date_to=timeline_params.date_to,
+            from_address=timeline_params.from_address,
+            is_outbound=timeline_params.is_outbound,
+        )
+        
+        return result
     
     def handle_request(self, request: dict) -> dict | None:
         method = request.get("method")
@@ -274,6 +295,22 @@ class MCPServer:
                                 "properties": {
                                     "limit": {"type": "integer", "description": "Max projects to return (1-50)", "default": 20}
                                 }
+                            }
+                        },
+                        {
+                            "name": "get_mention_timeline",
+                            "description": "Get a timeline of mentions for a keyword, grouped by year/month/quarter",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "keyword": {"type": "string", "description": "Exact keyword or name to search"},
+                                    "granularity": {"type": "string", "enum": ["year", "month", "quarter"], "description": "Grouping granularity", "default": "year"},
+                                    "date_from": {"type": "string", "description": "Start date ISO 8601"},
+                                    "date_to": {"type": "string", "description": "End date ISO 8601"},
+                                    "from_address": {"type": "string", "description": "Filter by sender"},
+                                    "is_outbound": {"type": "boolean", "description": "Filter by direction"}
+                                },
+                                "required": ["keyword"]
                             }
                         }
                     ]
