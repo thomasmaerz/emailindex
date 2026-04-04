@@ -19,7 +19,7 @@ from .models import (
 from .database import (
     search_emails, get_email, get_conversation, find_recipient_emails,
     query_email_database, get_project_context, list_projects,
-    get_mention_timeline, get_contact_profile, get_thread_arc
+    get_mention_timeline, get_contact_profile, get_thread_arc, list_threads
 )
 from .config import Config
 
@@ -37,6 +37,7 @@ class MCPServer:
             "get_mention_timeline": self.tool_get_mention_timeline,
             "get_contact_profile": self.tool_get_contact_profile,
             "get_thread_arc": self.tool_get_thread_arc,
+            "list_threads": self.tool_list_threads,
         }
     
     def _verify_schema(self):
@@ -204,6 +205,19 @@ class MCPServer:
         
         return result
     
+    def tool_list_threads(self, params: dict) -> dict:
+        sort_by = params.get("sort_by", "message_count")
+        sort_order = params.get("sort_order", "desc")
+        limit = params.get("limit", 10)
+        
+        result = list_threads(
+            sort_by=sort_by,
+            sort_order=sort_order,
+            limit=limit,
+        )
+        
+        return result
+    
     def handle_request(self, request: dict) -> dict | None:
         method = request.get("method")
         params = request.get("params", {})
@@ -298,7 +312,7 @@ class MCPServer:
                     "tools": [
                         {
                             "name": "query_email_database",
-                            "description": "Unified email search with FTS5 tag filtering, vector similarity, and metadata filters",
+                            "description": "Unified email search with FTS5 tag filtering, vector similarity, and metadata filters. Use this for keyword searches (exact_keywords), semantic similarity (semantic_query), filtering by category/project (category_filter, project_filter), date ranges (date_from, date_to), sender/recipient (from_address, to_address), and more. For contact-specific searches use get_contact_profile; for timeline analysis use get_mention_timeline; for thread-level queries use get_thread_by_id or get_thread_arc; to find threads by message count use list_threads; for project context use get_project_context; to fetch a specific email use get_email_by_id; to list available projects use list_projects.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -409,6 +423,18 @@ class MCPServer:
                                     "max_messages": {"type": "integer", "description": "Max messages to return (1-50)", "default": 20}
                                 },
                                 "required": ["thread_id"]
+                            }
+                        },
+                        {
+                            "name": "list_threads",
+                            "description": "List all conversation threads sorted by various metrics (message_count, participant_count, last_activity, first_activity)",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "sort_by": {"type": "string", "enum": ["message_count", "participant_count", "last_activity", "first_activity"], "description": "Sort field", "default": "message_count"},
+                                    "sort_order": {"type": "string", "enum": ["asc", "desc"], "description": "Sort order", "default": "desc"},
+                                    "limit": {"type": "integer", "description": "Max threads to return (1-50)", "default": 10}
+                                }
                             }
                         }
                     ]

@@ -403,7 +403,7 @@ def query_email_database(
     if exact_keywords:
         safe_query = exact_keywords.strip()
         if safe_query:
-            where_clauses.append("e.rowid IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)")
+            where_clauses.append("emails_fts MATCH ?")
             params.append(safe_query)
 
     if category_filter or project_filter:
@@ -463,6 +463,72 @@ def query_email_database(
 
     # Determine sort order
     use_fts_join = bool(exact_keywords)
+    
+    # Determine if we need snippet (check before semantic query path)
+    use_snippet = snippet_only and (exact_keywords or semantic_query)
+    
+    # Handle semantic query (vector search)
+    if semantic_query and not exact_keywords:
+        try:
+            query_embedding = _encode_text_to_embedding(semantic_query)
+        except Exception as e:
+            close_connection()
+            return {"error": f"Failed to encode semantic query: {e}", "results": []}
+        
+        sql = """
+            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                   e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                   COALESCE(e.body_text, e.body_markdown) as body_text,
+                   vec_distance_cosine(ev.embedding, ?) as relevance_score
+            FROM emails e
+            JOIN email_vectors ev ON e.id = ev.email_id
+            WHERE (e.source IS NULL OR e.source != 'quoted_reply')
+            ORDER BY relevance_score ASC
+            LIMIT ?
+        """
+        params.insert(0, query_embedding)
+        params.append(limit)
+        
+        cursor_conn.execute(sql, params)
+        results = cursor_conn.fetchall()
+        
+        output = []
+        for row in results:
+            row_dict = dict(row)
+            body_text = row_dict.get("body_text", "")
+            item = {
+                "id": row_dict["id"],
+                "thread_id": row_dict.get("thread_id"),
+                "timestamp": row_dict["timestamp"],
+                "from_address": row_dict["from_address"],
+                "from_name": row_dict.get("from_name"),
+                "subject": row_dict["subject"],
+                "is_outbound": bool(row_dict.get("is_outbound", 0)),
+                "has_attachments": bool(row_dict.get("has_attachments", 0)),
+                "source": row_dict.get("source", "original"),
+                "category_tags": json.loads(row_dict["category_tags"]) if row_dict.get("category_tags") else [],
+                "project_tags": json.loads(row_dict["project_tags"]) if row_dict.get("project_tags") else [],
+                "relevance_score": row_dict["relevance_score"],
+            }
+            if use_snippet:
+                item["snippet"] = body_text[:300] if body_text else ""
+            output.append(item)
+        
+        close_connection()
+        response = {"results": output}
+        if output:
+            last = output[-1]
+            if "timestamp" in last and "id" in last:
+                response["next_cursor"] = _encode_cursor(last["timestamp"], last["id"])
+                response["has_more"] = len(output) == limit
+            else:
+                response["next_cursor"] = None
+                response["has_more"] = False
+        else:
+            response["next_cursor"] = None
+            response["has_more"] = False
+        return response
+    
     if sort_by == "timestamp":
         order = "ASC" if sort_order == "asc" else "DESC"
         order_clause = f"ORDER BY e.timestamp {order}"
@@ -482,7 +548,7 @@ def query_email_database(
             use_fts_join = False
 
     # Determine if we need snippet
-    use_snippet = snippet_only and exact_keywords
+    use_snippet = snippet_only and (exact_keywords or semantic_query)
 
     # Build SELECT columns
     if use_snippet:
@@ -490,7 +556,7 @@ def query_email_database(
             SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
                    e.from_name, e.has_attachments, e.folder,
                    snippet(emails_fts, 1, '<mark>', '</mark>', '...', {snippet_length}) as snippet,
-                   fts.rank
+                   bm25(emails_fts) as rank
             FROM emails e
             JOIN emails_fts fts ON e.rowid = fts.rowid
             WHERE {where_sql}
@@ -500,19 +566,29 @@ def query_email_database(
         use_fts_join = True
     elif fields is not None:
         columns = _build_select_columns(fields)
-        sql = f"""
-            SELECT {columns}
-            FROM emails e
-            WHERE {where_sql}
-            {order_clause}
-            LIMIT ?
-        """
+        if use_fts_join:
+            sql = f"""
+                SELECT {columns}, bm25(emails_fts) as rank
+                FROM emails e
+                JOIN emails_fts fts ON e.rowid = fts.rowid
+                WHERE {where_sql}
+                {order_clause}
+                LIMIT ?
+            """
+        else:
+            sql = f"""
+                SELECT {columns}
+                FROM emails e
+                WHERE {where_sql}
+                {order_clause}
+                LIMIT ?
+            """
     else:
         if use_fts_join:
             sql = f"""
                 SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
                        e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
-                       COALESCE(e.body_text, e.body_markdown) as body_text, fts.rank
+                       COALESCE(e.body_text, e.body_markdown) as body_text, bm25(emails_fts) as rank
                 FROM emails e
                 JOIN emails_fts fts ON e.rowid = fts.rowid
                 WHERE {where_sql}
@@ -541,12 +617,16 @@ def query_email_database(
         for row in results:
             try:
                 r = row["rank"]
-                raw_ranks.append(abs(r) if r is not None else 0)
+                raw_ranks.append(r if r is not None else 0)
             except (IndexError, KeyError):
                 raw_ranks.append(0)
         if raw_ranks:
-            max_rank = max(raw_ranks) if max(raw_ranks) > 0 else 1
-            rank_values = [round(1.0 - (r / max_rank), 4) if max_rank > 0 else 1.0 for r in raw_ranks]
+            min_rank = min(raw_ranks)
+            max_rank = max(raw_ranks)
+            if max_rank > min_rank:
+                rank_values = [round(1.0 - (r - min_rank) / (max_rank - min_rank), 4) for r in raw_ranks]
+            else:
+                rank_values = [1.0] * len(raw_ranks)
 
     output = []
     thread_ids = set()
@@ -823,8 +903,8 @@ def get_contact_profile(
     params = []
 
     if name:
-        where_clauses.append("e.from_name LIKE ?")
-        params.append(f"%{name}%")
+        where_clauses.append("(e.from_name LIKE ? OR e.sender LIKE ? OR e.recipients LIKE ? OR e.to_addresses LIKE ? OR e.cc_addresses LIKE ?)")
+        params.extend([f"%{name}%", f"%{name}%", f"%{name}%", f"%{name}%", f"%{name}%"])
     if email_address:
         where_clauses.append("(e.sender LIKE ? OR e.recipients LIKE ?)")
         params.extend([f"%{email_address}%", f"%{email_address}%"])
@@ -970,3 +1050,70 @@ def get_thread_arc(
         "date_range": list(date_range),
         "messages": messages,
     }
+
+
+def list_threads(
+    sort_by: str = "message_count",
+    sort_order: str = "desc",
+    limit: int = 10,
+) -> dict:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    if sort_by == "message_count":
+        order_expr = "COUNT(*) {order}".format(order="DESC" if sort_order == "desc" else "ASC")
+    elif sort_by == "participant_count":
+        order_expr = "participant_count {order}".format(order="DESC" if sort_order == "desc" else "ASC")
+    elif sort_by == "last_activity":
+        order_expr = "MAX(e.timestamp) {order}".format(order="DESC" if sort_order == "desc" else "ASC")
+    elif sort_by == "first_activity":
+        order_expr = "MIN(e.timestamp) {order}".format(order="DESC" if sort_order == "desc" else "ASC")
+    else:
+        order_expr = "COUNT(*) DESC"
+
+    cursor.execute(f"""
+        SELECT e.thread_id, e.subject_thread_key,
+               COUNT(*) as message_count,
+               COUNT(DISTINCT COALESCE(e.sender, '') || COALESCE(e.recipients, '')) as participant_count,
+               MIN(e.timestamp) as first_activity,
+               MAX(e.timestamp) as last_activity
+        FROM emails e
+        WHERE e.thread_id IS NOT NULL
+          AND (e.source IS NULL OR e.source != 'quoted_reply')
+        GROUP BY e.thread_id
+        ORDER BY {order_expr}
+        LIMIT ?
+    """, (limit,))
+
+    rows = cursor.fetchall()
+
+    threads = []
+    for row in rows:
+        cursor.execute("""
+            SELECT e.id, e.subject, e.timestamp, e.sender as from_address, e.from_name
+            FROM emails e
+            WHERE e.thread_id = ?
+              AND (e.source IS NULL OR e.source != 'quoted_reply')
+            ORDER BY e.timestamp DESC
+            LIMIT 1
+        """, (row["thread_id"],))
+        latest = cursor.fetchone()
+
+        threads.append({
+            "thread_id": row["thread_id"],
+            "subject_thread_key": row["subject_thread_key"],
+            "message_count": row["message_count"],
+            "participant_count": row["participant_count"],
+            "first_activity": row["first_activity"],
+            "last_activity": row["last_activity"],
+            "latest_email": {
+                "id": latest["id"] if latest else None,
+                "subject": latest["subject"] if latest else None,
+                "timestamp": latest["timestamp"] if latest else None,
+                "from_address": latest["from_address"] if latest else None,
+                "from_name": latest["from_name"] if latest else None,
+            } if latest else None,
+        })
+
+    close_connection()
+    return {"threads": threads, "count": len(threads)}
