@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 import json
 
@@ -210,11 +210,19 @@ class QueryEmailParams(BaseModel):
     date_from: Optional[str] = Field(None, description="Start date ISO 8601")
     date_to: Optional[str] = Field(None, description="End date ISO 8601")
     from_address: Optional[str] = Field(None, description="Filter by sender")
+    from_name: Optional[str] = Field(None, description="Filter by sender display name (LIKE match)")
     to_address: Optional[str] = Field(None, description="Filter by recipient")
     is_outbound: Optional[bool] = Field(None, description="Filter by direction")
     has_attachments: Optional[bool] = Field(None, description="Filter by attachments")
     limit: int = Field(10, ge=1, le=50, description="Max results")
     include_full_thread: bool = Field(default=False, description="Return full thread")
+    sort_by: Optional[str] = Field(default=None, description="Sort by 'timestamp' or 'relevance'. Defaults: 'relevance' for keyword/vector, 'timestamp' for metadata-only.")
+    sort_order: Optional[str] = Field(default=None, description="Sort order 'asc' or 'desc'. Default: 'desc'.")
+    count_only: bool = Field(default=False, description="Return only count, no results")
+    fields: Optional[List[str]] = Field(default=None, description="Specific fields to return. Default: minimal set.")
+    snippet_only: bool = Field(default=False, description="Return FTS5 snippet instead of full body")
+    snippet_length: int = Field(default=32, description="FTS5 snippet token window size")
+    cursor: Optional[str] = Field(default=None, description="Opaque pagination cursor from previous response")
 
 
 class GetProjectContextParams(BaseModel):
@@ -222,3 +230,9 @@ class GetProjectContextParams(BaseModel):
     
     project_name: str = Field(..., description="Project name or alias")
     limit: int = Field(10, ge=1, le=50, description="Max emails to return")
+
+
+class ListProjectsParams(BaseModel):
+    model_config = ConfigDict(strict=True)
+    
+    limit: int = Field(20, ge=1, le=50, description="Max projects to return")

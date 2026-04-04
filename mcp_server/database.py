@@ -1,12 +1,87 @@
 import sqlite3
 import json
 import threading
+import base64
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from .config import Config
 from .models import EmailRecord, EmailSearchResult, ConversationThread, AttachmentRecord
 import zstandard as zstd
 import numpy as np
+
+
+# Default field set when 'fields' is not specified — body content is opt-in
+DEFAULT_FIELDS = [
+    "id", "thread_id", "timestamp", "from_address", "from_name",
+    "subject", "is_outbound", "has_attachments", "source",
+    "category_tags", "project_tags", "relevance_score"
+]
+
+# All allowed fields for projection
+ALLOWED_FIELDS = {
+    "id", "thread_id", "subject_thread_key", "timestamp", "from_address",
+    "from_name", "to_addresses", "cc_addresses", "recipients", "subject",
+    "body_text", "body_markdown", "body_plain", "has_attachments",
+    "attachments", "folder", "is_outbound", "category_tags", "project_tags",
+    "parent_id", "source", "content_hash", "message_id", "x_mailer",
+    "relevance_score", "snippet"
+}
+
+# Fields that are NEVER returned in API responses
+EXCLUDED_FIELDS = {"raw_eml", "embedding"}
+
+
+def _build_select_columns(fields):
+    """Build SQL column list for field projection."""
+    if fields is None:
+        fields = DEFAULT_FIELDS
+
+    fields = [f for f in fields if f not in EXCLUDED_FIELDS]
+
+    column_map = {
+        "id": "e.id",
+        "thread_id": "e.thread_id",
+        "subject_thread_key": "e.subject_thread_key",
+        "timestamp": "e.timestamp",
+        "from_address": "e.sender as from_address",
+        "from_name": "e.from_name",
+        "to_addresses": "e.to_addresses",
+        "cc_addresses": "e.cc_addresses",
+        "recipients": "e.recipients",
+        "subject": "e.subject",
+        "body_text": "COALESCE(e.body_text, e.body_markdown) as body_text",
+        "body_markdown": "e.body_markdown",
+        "body_plain": "e.body_plain",
+        "has_attachments": "e.has_attachments",
+        "attachments": "e.attachments",
+        "folder": "e.folder",
+        "is_outbound": "e.is_outbound",
+        "category_tags": "e.category_tags",
+        "project_tags": "e.project_tags",
+        "parent_id": "e.parent_id",
+        "source": "e.source",
+        "content_hash": "e.content_hash",
+        "message_id": "e.message_id",
+        "x_mailer": "e.x_mailer",
+    }
+
+    columns = []
+    for f in fields:
+        if f in column_map:
+            columns.append(column_map[f])
+
+    return ", ".join(columns) if columns else "e.id"
+
+
+def _encode_cursor(timestamp: str, email_id: str) -> str:
+    data = json.dumps({"ts": timestamp, "id": email_id})
+    return base64.b64encode(data.encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> tuple:
+    data = base64.b64decode(cursor.encode()).decode()
+    obj = json.loads(data)
+    return obj["ts"], obj["id"]
 
 
 _thread_local = threading.local()
@@ -312,10 +387,14 @@ def query_email_database(
     include_full_thread: bool = False,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = None,
-    count_only: bool = False
+    count_only: bool = False,
+    fields: Optional[List[str]] = None,
+    snippet_only: bool = False,
+    snippet_length: int = 32,
+    cursor: Optional[str] = None,
 ) -> dict:
     conn = get_connection()
-    cursor = conn.cursor()
+    cursor_conn = conn.cursor()
 
     where_clauses = []
     params = []
@@ -362,12 +441,23 @@ def query_email_database(
         params.append(1 if has_attachments else 0)
 
     where_clauses.append("(e.source IS NULL OR e.source != 'quoted_reply')")
+
+    # Cursor-based pagination (keyset pagination)
+    if cursor:
+        last_ts, last_id = _decode_cursor(cursor)
+        if sort_order == "asc":
+            where_clauses.append("(e.timestamp > ? OR (e.timestamp = ? AND e.id > ?))")
+            params.extend([last_ts, last_ts, last_id])
+        else:
+            where_clauses.append("(e.timestamp < ? OR (e.timestamp = ? AND e.id < ?))")
+            params.extend([last_ts, last_ts, last_id])
+
     where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
 
     # Handle count_only
     if count_only:
-        cursor.execute(f"SELECT COUNT(*) as cnt FROM emails e WHERE {where_sql}", params)
-        count = cursor.fetchone()["cnt"]
+        cursor_conn.execute(f"SELECT COUNT(*) as cnt FROM emails e WHERE {where_sql}", params)
+        count = cursor_conn.fetchone()["cnt"]
         close_connection()
         return {"count": count}
 
@@ -376,7 +466,7 @@ def query_email_database(
     if sort_by == "timestamp":
         order = "ASC" if sort_order == "asc" else "DESC"
         order_clause = f"ORDER BY e.timestamp {order}"
-        use_fts_join = False  # Don't need FTS join for timestamp sort
+        use_fts_join = False
     elif sort_by == "relevance":
         order = "ASC" if sort_order == "asc" else "DESC"
         if exact_keywords:
@@ -391,31 +481,58 @@ def query_email_database(
             order_clause = "ORDER BY e.timestamp DESC"
             use_fts_join = False
 
-    if use_fts_join:
+    # Determine if we need snippet
+    use_snippet = snippet_only and exact_keywords
+
+    # Build SELECT columns
+    if use_snippet:
         sql = f"""
             SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
-                   e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
-                   COALESCE(e.body_text, e.body_markdown) as body_text, fts.rank
+                   e.from_name, e.has_attachments, e.folder,
+                   snippet(emails_fts, 1, '<mark>', '</mark>', '...', {snippet_length}) as snippet,
+                   fts.rank
             FROM emails e
             JOIN emails_fts fts ON e.rowid = fts.rowid
             WHERE {where_sql}
             {order_clause}
             LIMIT ?
         """
-    else:
+        use_fts_join = True
+    elif fields is not None:
+        columns = _build_select_columns(fields)
         sql = f"""
-            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
-                   e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
-                   COALESCE(e.body_text, e.body_markdown) as body_text
+            SELECT {columns}
             FROM emails e
             WHERE {where_sql}
             {order_clause}
             LIMIT ?
         """
+    else:
+        if use_fts_join:
+            sql = f"""
+                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                       e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                       COALESCE(e.body_text, e.body_markdown) as body_text, fts.rank
+                FROM emails e
+                JOIN emails_fts fts ON e.rowid = fts.rowid
+                WHERE {where_sql}
+                {order_clause}
+                LIMIT ?
+            """
+        else:
+            sql = f"""
+                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                       e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                       COALESCE(e.body_text, e.body_markdown) as body_text
+                FROM emails e
+                WHERE {where_sql}
+                {order_clause}
+                LIMIT ?
+            """
     params.append(limit)
 
-    cursor.execute(sql, params)
-    results = cursor.fetchall()
+    cursor_conn.execute(sql, params)
+    results = cursor_conn.fetchall()
 
     # Compute normalized relevance scores for FTS5
     rank_values = []
@@ -434,26 +551,60 @@ def query_email_database(
     output = []
     thread_ids = set()
     for i, row in enumerate(results):
-        relevance = rank_values[i] if i < len(rank_values) else None
-        output.append({
-            "id": row["id"],
-            "thread_id": row["thread_id"],
-            "subject": row["subject"],
-            "timestamp": row["timestamp"],
-            "from_address": row["from_address"],
-            "from_name": row["from_name"],
-            "category_tags": json.loads(row["category_tags"]) if row["category_tags"] else [],
-            "project_tags": json.loads(row["project_tags"]) if row["project_tags"] else [],
-            "snippet": row["body_text"][:500] if row["body_text"] else "",
-            "has_attachments": bool(row["has_attachments"]),
-            "folder": row["folder"],
-            "relevance_score": relevance
-        })
-        if row["thread_id"]:
-            thread_ids.add(row["thread_id"])
+        if use_snippet:
+            item = {
+                "id": row["id"],
+                "thread_id": row["thread_id"],
+                "subject": row["subject"],
+                "timestamp": row["timestamp"],
+                "from_address": row["from_address"],
+                "from_name": row["from_name"],
+                "snippet": row["snippet"],
+                "has_attachments": bool(row["has_attachments"]),
+                "folder": row["folder"],
+            }
+        elif fields is not None:
+            # Custom field projection
+            item = {}
+            row_dict = dict(row)
+            for f in fields:
+                if f in EXCLUDED_FIELDS:
+                    continue
+                if f == "relevance_score":
+                    item[f] = rank_values[i] if i < len(rank_values) else None
+                elif f == "snippet":
+                    item[f] = row_dict.get("body_text", "")[:500] if row_dict.get("body_text") else ""
+                elif f in ("category_tags", "project_tags", "recipients", "to_addresses", "cc_addresses", "attachments"):
+                    val = row_dict.get(f)
+                    item[f] = json.loads(val) if val else []
+                elif f in row_dict:
+                    item[f] = row_dict[f]
+        else:
+            # Default minimal fields
+            row_dict = dict(row)
+            item = {
+                "id": row_dict["id"],
+                "thread_id": row_dict.get("thread_id"),
+                "timestamp": row_dict["timestamp"],
+                "from_address": row_dict["from_address"],
+                "from_name": row_dict.get("from_name"),
+                "subject": row_dict["subject"],
+                "is_outbound": bool(row_dict.get("is_outbound", 0)),
+                "has_attachments": bool(row_dict.get("has_attachments", 0)),
+                "source": row_dict.get("source", "original"),
+                "category_tags": json.loads(row_dict["category_tags"]) if row_dict.get("category_tags") else [],
+                "project_tags": json.loads(row_dict["project_tags"]) if row_dict.get("project_tags") else [],
+                "relevance_score": rank_values[i] if i < len(rank_values) else None,
+            }
+
+        output.append(item)
+        if not use_snippet and fields is None:
+            row_dict = dict(row)
+            if row_dict.get("thread_id"):
+                thread_ids.add(row_dict["thread_id"])
 
     if include_full_thread and thread_ids:
-        cursor.execute("""
+        cursor_conn.execute("""
             SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
                    e.body_text
             FROM emails e
@@ -462,7 +613,7 @@ def query_email_database(
             ORDER BY e.timestamp ASC
         """.format(",".join(["?"] * len(thread_ids))), list(thread_ids))
 
-        thread_emails = cursor.fetchall()
+        thread_emails = cursor_conn.fetchall()
         threads = {}
         for te in thread_emails:
             tid = te["thread_id"]
@@ -477,10 +628,30 @@ def query_email_database(
             })
 
         close_connection()
-        return {"results": output, "threads": threads}
+        response = {"results": output, "threads": threads}
+        if output:
+            last = output[-1]
+            response["next_cursor"] = _encode_cursor(last["timestamp"], last["id"])
+            response["has_more"] = len(output) == limit
+        else:
+            response["next_cursor"] = None
+            response["has_more"] = False
+        return response
 
     close_connection()
-    return {"results": output}
+    response = {"results": output}
+    if output:
+        last = output[-1]
+        if "timestamp" in last and "id" in last:
+            response["next_cursor"] = _encode_cursor(last["timestamp"], last["id"])
+            response["has_more"] = len(output) == limit
+        else:
+            response["next_cursor"] = None
+            response["has_more"] = False
+    else:
+        response["next_cursor"] = None
+        response["has_more"] = False
+    return response
 
 
 def get_project_context(project_name: str, limit: int = 10) -> Optional[dict]:

@@ -13,9 +13,12 @@ import sqlite3
 from .models import (
     EmailRecord, EmailSearchResult, ConversationThread,
     SearchParams, GetEmailParams, GetConversationParams, FindRecipientParams,
-    QueryEmailParams, GetProjectContextParams
+    QueryEmailParams, GetProjectContextParams, ListProjectsParams
 )
-from .database import search_emails, get_email, get_conversation, find_recipient_emails, query_email_database, get_project_context
+from .database import (
+    search_emails, get_email, get_conversation, find_recipient_emails,
+    query_email_database, get_project_context, list_projects
+)
 from .config import Config
 
 
@@ -26,6 +29,9 @@ class MCPServer:
         self.tools = {
             "query_email_database": self.tool_query_email_database,
             "get_project_context": self.tool_get_project_context,
+            "get_email_by_id": self.tool_get_email_by_id,
+            "get_thread_by_id": self.tool_get_thread_by_id,
+            "list_projects": self.tool_list_projects,
         }
     
     def _verify_schema(self):
@@ -45,6 +51,19 @@ class MCPServer:
             print("Run: python migrate_v2.py", file=sys.stderr)
             sys.exit(1)
         
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='project_registry'")
+        if not cursor.fetchone():
+            print("INFO: project_registry table not found, creating empty", file=sys.stderr)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS project_registry (
+                    name TEXT PRIMARY KEY,
+                    aliases TEXT,
+                    summary TEXT,
+                    created_at TEXT
+                )
+            """)
+            conn.commit()
+        
         conn.close()
     
     def tool_query_email_database(self, params: dict) -> dict:
@@ -61,11 +80,19 @@ class MCPServer:
             date_from=query_params.date_from,
             date_to=query_params.date_to,
             from_address=query_params.from_address,
+            from_name=query_params.from_name,
             to_address=query_params.to_address,
             is_outbound=query_params.is_outbound,
             has_attachments=query_params.has_attachments,
             limit=query_params.limit,
-            include_full_thread=query_params.include_full_thread
+            include_full_thread=query_params.include_full_thread,
+            sort_by=query_params.sort_by,
+            sort_order=query_params.sort_order,
+            count_only=query_params.count_only,
+            fields=query_params.fields,
+            snippet_only=query_params.snippet_only,
+            snippet_length=query_params.snippet_length,
+            cursor=query_params.cursor if hasattr(query_params, 'cursor') else None
         )
         
         return results
@@ -85,6 +112,45 @@ class MCPServer:
             return None
         
         return result
+    
+    def tool_get_email_by_id(self, params: dict) -> dict | None:
+        try:
+            email_params = GetEmailParams(**params)
+        except Exception as e:
+            return {"error": str(e)}
+        
+        result = get_email(email_params.email_id)
+        
+        if result is None:
+            return None
+        
+        return result.model_dump(mode='json')
+    
+    def tool_get_thread_by_id(self, params: dict) -> dict | None:
+        try:
+            thread_params = GetConversationParams(**params)
+        except Exception as e:
+            return {"error": str(e)}
+        
+        result = get_conversation(thread_params.thread_id)
+        
+        if result is None:
+            return None
+        
+        return result.model_dump(mode='json')
+    
+    def tool_list_projects(self, params: dict) -> dict:
+        try:
+            projects_params = ListProjectsParams(**params)
+        except Exception as e:
+            return {"error": str(e)}
+        
+        results = list_projects(projects_params.limit)
+        
+        return {
+            "projects": results,
+            "count": len(results)
+        }
     
     def handle_request(self, request: dict) -> dict | None:
         method = request.get("method")
@@ -154,7 +220,15 @@ class MCPServer:
                                     "is_outbound": {"type": "boolean", "description": "Filter by direction"},
                                     "has_attachments": {"type": "boolean", "description": "Filter by attachments"},
                                     "limit": {"type": "integer", "description": "Max results (1-50)", "default": 10},
-                                    "include_full_thread": {"type": "boolean", "description": "Return full thread", "default": False}
+                                    "include_full_thread": {"type": "boolean", "description": "Return full thread", "default": False},
+                                    "from_name": {"type": "string", "description": "Filter by sender display name (LIKE match)"},
+                                    "sort_by": {"type": "string", "enum": ["timestamp", "relevance"], "description": "Sort field"},
+                                    "sort_order": {"type": "string", "enum": ["asc", "desc"], "description": "Sort order"},
+                                    "count_only": {"type": "boolean", "description": "Return only count, no results", "default": False},
+                                    "fields": {"type": "array", "items": {"type": "string"}, "description": "Specific fields to return"},
+                                    "snippet_only": {"type": "boolean", "description": "Return FTS5 snippet instead of full body", "default": False},
+                                    "snippet_length": {"type": "integer", "description": "FTS5 snippet token window size", "default": 32},
+                                    "cursor": {"type": "string", "description": "Opaque pagination cursor from previous response"}
                                 }
                             }
                         },
@@ -168,6 +242,38 @@ class MCPServer:
                                     "limit": {"type": "integer", "description": "Max emails to return (1-50)", "default": 10}
                                 },
                                 "required": ["project_name"]
+                            }
+                        },
+                        {
+                            "name": "get_email_by_id",
+                            "description": "Fetch a specific email by its UUID. Use when you have an email ID from a search result and need the full record.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "email_id": {"type": "string", "description": "UUIDv4 of the email"}
+                                },
+                                "required": ["email_id"]
+                            }
+                        },
+                        {
+                            "name": "get_thread_by_id",
+                            "description": "Fetch all emails in a conversation thread by thread ID. Returns full conversation with metadata.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "thread_id": {"type": "string", "description": "Thread ID (format: thread-*)"}
+                                },
+                                "required": ["thread_id"]
+                            }
+                        },
+                        {
+                            "name": "list_projects",
+                            "description": "List all projects in the registry. Use to discover available projects before filtering by project_filter.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "limit": {"type": "integer", "description": "Max projects to return (1-50)", "default": 20}
+                                }
                             }
                         }
                     ]
