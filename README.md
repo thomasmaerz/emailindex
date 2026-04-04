@@ -247,7 +247,7 @@ python3 salvage_quotes.py
 
 ## MCP Tools
 
-The server exposes **2 tools** for AI assistants:
+The server exposes **5 tools** for AI assistants:
 
 ### `query_email_database`
 
@@ -318,6 +318,55 @@ Get project metadata and related emails from the project registry.
 ```python
 get_project_context(project_name="ProjectAlpha", limit=10)
 # Returns: { "project": {...}, "emails": [...] }
+```
+
+### `get_email_by_id`
+
+Fetch a specific email by its UUID. Use when you have an email ID from a search result and need the full record.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `email_id` | string | UUIDv4 of the email (required) |
+
+**Example:**
+```python
+get_email_by_id(email_id="550e8400-e29b-41d4-a716-446655440000")
+# Returns: Full EmailRecord with body_markdown, attachments, etc.
+```
+
+### `get_thread_by_id`
+
+Fetch all emails in a conversation thread by thread ID. Returns full conversation with metadata.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `thread_id` | string | Thread ID (format: thread-*) (required) |
+| `limit` | integer | Max emails to return (1-50, default: 50) |
+
+**Example:**
+```python
+get_thread_by_id(thread_id="thread-abc123def456")
+# Returns: { "thread_id": "...", "subject": "...", "emails": [...] }
+```
+
+### `list_projects`
+
+List all projects in the registry. Use to discover available projects before filtering by project_filter.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `limit` | integer | Max projects to return (1-50, default: 20) |
+
+**Example:**
+```python
+list_projects()
+# Returns: { "projects": [...], "count": N }
 ```
 
 ---
