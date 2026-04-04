@@ -351,7 +351,10 @@ def test_mcp_server_tools_list():
             "get_project_context",
             "get_email_by_id",
             "get_thread_by_id",
-            "list_projects"
+            "list_projects",
+            "get_mention_timeline",
+            "get_contact_profile",
+            "get_thread_arc"
         ]
         
         for tool in expected_tools:
