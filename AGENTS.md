@@ -86,7 +86,7 @@ emailindex/                          # Root of the Email Intelligence System
 
 ## 3. MCP Tools Reference
 
-The MCP server exposes exactly **2 tools**. Always use the correct tool for the task.
+The MCP server exposes exactly **5 tools**. Always use the correct tool for the task.
 
 ### 3.1 query_email_database
 
@@ -163,6 +163,79 @@ The MCP server exposes exactly **2 tools**. Always use the correct tool for the 
 
 ---
 
+### 3.5 get_email_by_id
+
+**Purpose:** Fetch a specific email by its UUID. Use when you have an email ID from a search result and need the full record.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `email_id` | string | Yes | UUIDv4 of the email |
+
+**Returns:** Full `EmailRecord` dictionary with:
+- `id`, `message_id`, `thread_id`, `subject_thread_key`
+- `timestamp`, `from_address`, `from_name`, `to_addresses`, `cc_addresses`
+- `subject`, `body_markdown`, `body_plain`
+- `has_attachments`, `attachments` (array)
+- `folder`, `category_tags`, `project_tags`, `is_outbound`
+
+**Notes:**
+- Returns `null` if email not found
+- Useful for fetching specific email after getting its ID from search results
+
+---
+
+### 3.6 get_thread_by_id
+
+**Purpose:** Fetch all emails in a conversation thread by thread ID. Returns full conversation with metadata.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `thread_id` | string | Yes | Thread ID (format: thread-*) |
+
+**Returns:** `ConversationThread` dictionary with:
+- `thread_id`: The thread identifier
+- `subject`: Subject of the root email
+- `emails`: Array of `EmailRecord` objects, sorted by timestamp (oldest first)
+- `participant_count`: Number of unique participants
+- `date_range`: Tuple of (earliest, latest) timestamps
+- `attachment_count`: Total attachments in thread
+
+**Notes:**
+- Returns `null` if thread not found
+- Use when you have a thread_id and need the full conversation
+
+---
+
+### 3.7 list_projects
+
+**Purpose:** List all projects in the registry. Use to discover available projects before filtering by project_filter.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `limit` | integer | No | Max projects to return (default: 20, max: 50) |
+
+**Returns:** Dictionary with:
+- `projects`: Array of project objects
+- `count`: Number of projects returned
+
+Each project object contains:
+- `name`: Project name
+- `aliases`: Array of alternative names
+- `summary`: Project description
+- `created_at`: ISO 8601 timestamp
+
+**Notes:**
+- Returns empty `projects` array if no projects exist
+- Aliases are parsed from comma-separated storage into an array
+
+---
+
 ## 4. Tool Selection Rules
 
 ### 4.1 Decision Matrix
@@ -177,6 +250,9 @@ The MCP server exposes exactly **2 tools**. Always use the correct tool for the 
 | Find emails in a date range | `query_email_database(date_from=..., date_to=...)` |
 | Filter by sender/recipient | `query_email_database(from_address=..., to_address=...)` |
 | Get full thread in results | `query_email_database(include_full_thread=true)` |
+| Fetch specific email by ID | `get_email_by_id(email_id=...)` |
+| Fetch full thread by thread_id | `get_thread_by_id(thread_id=...)` |
+| List all known projects | `list_projects()` |
 
 ### 4.2 NEVER Do These
 
@@ -247,13 +323,13 @@ To find the thread_id for an email:
 
 ```python
 # Step 1: Get the email
-email = get_email(email_id="550e8400-e29b-41d4-a716-446655440000")
+email = get_email_by_id(email_id="550e8400-e29b-41d4-a716-446655440000")
 
 # Step 2: Use the thread_id field
 thread_id = email.thread_id  # e.g., "thread-abc123def456"
 
 # Step 3: Get full conversation
-conversation = get_conversation(thread_id=thread_id)
+conversation = get_thread_by_id(thread_id=thread_id)
 ```
 
 ---
@@ -730,6 +806,19 @@ search_emails(folder=".Trash")
 │  query_email_database(from_address="alice@example.com")        │
 │  query_email_database(to_address="bob@example.com")            │
 │                                                                 │
+│  FETCH EMAIL BY ID                                              │
+│  ─────────────────────                                          │
+│  get_email_by_id(email_id="550e8400-...")                       │
+│                                                                 │
+│  FETCH THREAD BY ID                                             │
+│  ─────────────────────────                                      │
+│  get_thread_by_id(thread_id="thread-abc123")                    │
+│                                                                 │
+│  LIST ALL PROJECTS                                              │
+│  ───────────────────                                            │
+│  list_projects()                                                │
+│  list_projects(limit=20)                                        │
+│                                                                 │
 ├─────────────────────────────────────────────────────────────────┤
 │  NEVER DO:                                                     │
 │  • raw_eml in context (too large)                               │
@@ -741,6 +830,8 @@ search_emails(folder=".Trash")
 ---
 
 ## 12. Testing & Validation
+
+All tests must clean up temp files (DBs, fixtures) in `finally` blocks. No test artifacts may persist after execution.
 
 The Email Intelligence System includes a comprehensive validation suite that tests the entire pipeline from raw email files through to the database and vector embeddings.
 
