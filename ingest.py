@@ -652,6 +652,9 @@ def init_database(db_path: Path):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
+    cursor.execute("PRAGMA journal_mode=WAL")
+    logger.info("SQLite WAL mode enabled")
+    
     try:
         import sqlite_vec
         conn.enable_load_extension(True)
