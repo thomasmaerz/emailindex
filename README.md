@@ -529,7 +529,6 @@ flowchart TD
     B -->|yes| C[Generate embedding]
     C --> D[vec_distance_cosine ORDER BY score]
     D --> E{cursor?}
-    
     B -->|no| F{exact_keywords?}
     F -->|yes| G[FTS5 MATCH]
     G --> E
@@ -538,12 +537,10 @@ flowchart TD
     I --> E
     H -->|no| J[Metadata filters]
     J --> E
-    
     E -->|yes| K[Keyset pagination from cursor]
     E -->|no| L[Standard offset]
     K --> M{count_only?}
     L --> M
-    
     M -->|yes| N[{ count: N }]
     M -->|no| O{fields?}
     O -->|yes| P[Field projection]
