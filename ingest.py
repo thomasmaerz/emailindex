@@ -18,6 +18,9 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
 from email.header import decode_header
 from email.message import Message
 import email
@@ -1456,6 +1459,12 @@ def main():
     parser.add_argument("maildir", nargs="?", type=Path, help="Path to Maildir directory")
     parser.add_argument("--no-resume", action="store_true", help="Start fresh, don't resume from checkpoint")
     parser.add_argument("--backfill", nargs="?", const="all", help="Run backfill on existing DB (default: all, or specify: is_outbound, categories, projects, etc.)")
+    parser.add_argument(
+        "--concurrent-limit",
+        type=int,
+        default=4,
+        help="Number of parallel workers for ingestion (default: 4)"
+    )
     
     args = parser.parse_args()
     
@@ -1477,7 +1486,7 @@ def main():
     
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     
-    ingest_emails(args.maildir, resume=not args.no_resume)
+    ingest_emails(args.maildir, resume=not args.no_resume, concurrent_limit=args.concurrent_limit)
 
 
 if __name__ == "__main__":
