@@ -541,7 +541,7 @@ flowchart TD
     E -->|no| L[Standard offset]
     K --> M{count_only?}
     L --> M
-    M -->|yes| N[{ count: N }]
+    M -->|yes| N[Return count only]
     M -->|no| O{fields?}
     O -->|yes| P[Field projection]
     O -->|no| Q[Default fields]
@@ -549,7 +549,7 @@ flowchart TD
     Q --> R
     R -->|yes| S[FTS5 snippet]
     R -->|no| T[Full body_markdown]
-    S --> U[{ results: [...], next_cursor }]
+    S --> U[Return results with next_cursor]
     T --> U
 ```
 
