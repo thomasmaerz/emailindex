@@ -29,7 +29,7 @@ The Email Intelligence System parses personal email archives into a queryable SQ
 - **Semantic vector search** using embeddings (BAAI/bge-small-en-v1.5, 384 dimensions)
 - **Conversation threading** based on RFC 822 headers
 - **Attachment management** with SHA-256 deduplication
-- **Resumable ingestion** for large archives (12+ years of email)
+- **Parallel resumable ingestion** for large archives (12+ years of email) using ThreadPoolExecutor with configurable concurrency
 
 ---
 
@@ -50,7 +50,7 @@ emailindex/
 │   └── server.py                                       # MCP tool routing, JSON-RPC handler
 ├── run-mcp-server.py                                   # MCP entry point (JSON-RPC 2.0)
 ├── run-mcp-server.sh                                   # Shell wrapper script
-├── ingest.py                                           # Main ingestion script
+├── ingest.py                                           # Main ingestion script (parallel, --concurrent-limit)
 ├── classify_emails.py                                  # Gemini batch classification
 ├── salvage_quotes.py                                   # Standalone quote re-salvage tool
 ├── requirements.txt

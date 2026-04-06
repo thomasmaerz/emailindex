@@ -306,7 +306,7 @@ flowchart LR
 
 ### 4.1 SQLite over PostgreSQL/MySQL
 - **Reason:** Single-file database simplifies backup, portability, and deployment
-- **Trade-off:** No concurrent write support (acceptable for read-heavy MCP use case)
+- **WAL mode:** Enabled for concurrent read/write access during parallel ingestion
 - **Alternative considered:** DuckDB (no sqlite-vec support at time of design)
 
 ### 4.2 sqlite-vec for Vector Search
@@ -705,9 +705,12 @@ See `ingest.py` for the actual implementations.
 ## 8. Ingestion Batching
 
 The ingestion pipeline in `ingest.py` supports:
+- **Parallel processing** via `ThreadPoolExecutor` with configurable `--concurrent-limit` (default: 4)
+- Per-worker SQLite connections with WAL mode for safe concurrent access
 - Batch processing with checkpoint-based resumption (`ingestion/resume.json`)
 - Resumable ingestion via `--backfill` flag (replaces standalone `migrate_v2.py`)
-- Thread-local database connections for safe parallel requests
+- Thread-safe checkpoint tracking with `threading.Lock`
+- Thread-local database connections for safe parallel MCP requests
 
 See `ingest.py` for the actual implementation. The checkpoint format is documented in `ingestion/resume.json`.
 

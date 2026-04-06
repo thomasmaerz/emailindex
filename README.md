@@ -38,7 +38,8 @@ A powerful indexing and search engine for Maildir email archives. Combines tradi
 - **Quote Salvage**: Extracts quoted reply blocks from inline email text using EmailReplyParser + custom Outlook pattern detection, with two-tier deduplication (hash-based + semantic similarity at 0.98 threshold).
 - **HTML Body Support**: Salvages quoted replies from HTML-only emails (no plain text part) by extracting text while preserving Outlook quote structure.
 - **Resumable Ingestion**: Batch-based ingestion pipeline with checkpointing and error recovery.
-- **Concurrency Support**: Thread-local database connections for safe parallel MCP requests.
+- **Parallel Ingestion**: ThreadPoolExecutor-based parsing with per-worker DB connections, configurable via `--concurrent-limit` (default: 4).
+- **Concurrency Support**: Thread-local database connections for safe parallel MCP requests and ingestion workers.
 - **Model Context Protocol (MCP)**: Exposes search and retrieval tools directly to AI assistants like Claude Desktop or OpenCode.
 - **AI-Powered Classification**: Gemini-based project discovery and email tagging with checkpoint-based resumption.
 - **Project Context**: Tag-based email categorization with project registry for contextual AI queries.
@@ -139,17 +140,32 @@ pip install -r requirements.txt
 ### 2. Ingestion
 
 ```bash
+# Default (4 parallel workers)
 python3 ingest.py /path/to/your/maildir
+
+# Custom concurrency
+python3 ingest.py /path/to/your/maildir --concurrent-limit 2
+python3 ingest.py /path/to/your/maildir --concurrent-limit 8
+
+# Start fresh (no resume)
+python3 ingest.py /path/to/your/maildir --no-resume
 ```
 
 This will:
-1. Parse all `.eml` files from your Maildir
+1. Parse all `.eml` files from your Maildir using parallel workers
 2. Convert HTML bodies to clean Markdown
 3. Extract quoted reply blocks and salvage them as separate records
-4. Generate 384-dimensional semantic embeddings
+4. Generate 384-dimensional semantic embeddings (batch-encoded on main thread)
 5. Compress and store raw email content with zstd
 6. Deduplicate attachments to `attachments/`
 7. Build FTS5 index and populate vector database
+
+**Parallel Ingestion Details:**
+- Workers parse emails independently with per-thread SQLite connections
+- SQLite WAL mode enabled for safe concurrent access
+- Embedding model loaded once on main thread, batch-encodes for efficiency
+- Thread-safe checkpoint tracking with `threading.Lock`
+- Duplicate detection before embedding work (saves computation)
 
 ### 3. AI Classification (Optional)
 
