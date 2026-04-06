@@ -1166,7 +1166,7 @@ def insert_email(conn: sqlite3.Connection, record: dict):
             logger.warning(f"Could not insert vector: {e}")
 
 
-def ingest_emails(maildir_path: Path, resume: bool = True):
+def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int = 4):
     init_database(DB_PATH)
     
     checkpoint = load_checkpoint()
@@ -1195,112 +1195,153 @@ def ingest_emails(maildir_path: Path, resume: bool = True):
         return
     
     embedder = Embedder()
-    pending_records = []
-    pending_texts = []
     
-    conn = get_db_connection(DB_PATH)
+    processed_count = checkpoint.get('processed_count', 0)
+    last_processed_path = checkpoint.get('last_processed_path', '')
+    errors = checkpoint.get('errors', [])
+    
+    state_lock = threading.Lock()
     
     owner_addresses = set()
     from mcp_server.config import Config
     if Config.USER_EMAIL_ADDRESSES:
         owner_addresses = set(Config.USER_EMAIL_ADDRESSES)
     else:
-        detected_owner = detect_mailbox_owner(conn)
-        if detected_owner:
-            owner_addresses = {detected_owner}
-            logger.info(f"Auto-detected mailbox owner: {detected_owner}")
+        with get_db_connection_ctx(DB_PATH) as conn:
+            detected_owner = detect_mailbox_owner(conn)
+            if detected_owner:
+                owner_addresses = {detected_owner}
+                logger.info(f"Auto-detected mailbox owner: {detected_owner}")
     
-    for idx, (eml_path, folder) in enumerate(email_files):
+    def parse_worker(eml_path: Path, folder: str):
+        """Worker function: parse email with its own DB connection."""
         try:
-            records = parse_email_file(eml_path, folder, conn, source_path=str(eml_path))
-            if not records:
-                checkpoint['errors'].append({
-                    'file_path': str(eml_path),
-                    'error_type': 'ParseError',
-                    'error_message': 'Failed to parse email',
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                })
-                continue
-            
-            # Check if original record (first in list) is duplicate
-            original_record = records[0]
-            if is_duplicate_message_id(conn, original_record['message_id']):
-                logger.debug(f"Skipping duplicate: {original_record['message_id']}")
-                checkpoint['processed_count'] += 1
-                checkpoint['last_processed_path'] = str(eml_path)
-                continue
-            
-            # Set is_outbound for all records based on owner detection
-            if owner_addresses:
-                for record in records:
-                    record['is_outbound'] = 1 if record['from_address'].lower() in {a.lower() for a in owner_addresses} else 0
-            
-            # Process all records (original + salvaged quotes) for embeddings
-            for record in records:
-                text = generate_embedding_text(record)
-                pending_records.append(record)
-                pending_texts.append(text)
-            
-            if len(pending_records) >= EMBEDDING_BATCH_SIZE:
-                embeddings = embedder.encode_batch(pending_texts)
+            with get_db_connection_ctx(DB_PATH) as conn:
+                records = parse_email_file(eml_path, folder, conn, source_path=str(eml_path))
+                if not records:
+                    return ('error', eml_path, 'ParseError', 'Failed to parse email')
                 
-                for rec, emb in zip(pending_records, embeddings):
-                    rec['embedding'] = emb
-                    insert_email(conn, rec)
+                original_record = records[0]
+                if is_duplicate_message_id(conn, original_record['message_id']):
+                    return ('duplicate', eml_path, original_record['message_id'])
                 
-                conn.commit()
+                if owner_addresses:
+                    for record in records:
+                        record['is_outbound'] = 1 if record['from_address'].lower() in {a.lower() for a in owner_addresses} else 0
                 
-                for rec in pending_records:
-                    checkpoint['processed_count'] += 1
-                    checkpoint['last_processed_path'] = rec.get('source_path', str(eml_path))
-                
-                logger.info(f"Processed {checkpoint['processed_count']}/{total_files} emails (including salvaged quotes)")
-                
-                if checkpoint['processed_count'] >= MAX_EMAILS:
-                    logger.info(f"Reached limit of {MAX_EMAILS} emails, stopping")
-                    break
-                
-                pending_records = []
-                pending_texts = []
-            
-            if checkpoint['processed_count'] > 0 and checkpoint['processed_count'] % CHECKPOINT_INTERVAL == 0:
-                save_checkpoint(checkpoint)
-        
+                return ('success', eml_path, records)
         except Exception as e:
-            logger.error(f"Error processing {eml_path}: {e}")
-            checkpoint['errors'].append({
-                'file_path': str(eml_path),
-                'error_type': type(e).__name__,
-                'error_message': str(e),
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            })
-            continue
+            return ('error', eml_path, type(e).__name__, str(e))
+    
+    pending_records = []
+    pending_texts = []
+    stopped = False
+    
+    with ThreadPoolExecutor(max_workers=concurrent_limit) as executor:
+        future_to_path = {}
+        
+        for eml_path, folder in email_files:
+            future = executor.submit(parse_worker, eml_path, folder)
+            future_to_path[future] = eml_path
+        
+        for future in as_completed(future_to_path):
+            eml_path = future_to_path[future]
+            
+            if stopped:
+                continue
+            
+            try:
+                result = future.result()
+                result_type = result[0]
+                
+                if result_type == 'duplicate':
+                    with state_lock:
+                        processed_count += 1
+                        last_processed_path = str(eml_path)
+                    continue
+                
+                if result_type == 'error':
+                    _, _, error_type, error_msg = result
+                    with state_lock:
+                        errors.append({
+                            'file_path': str(eml_path),
+                            'error_type': error_type,
+                            'error_message': error_msg,
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        })
+                    continue
+                
+                _, _, records = result
+                
+                for record in records:
+                    text = generate_embedding_text(record)
+                    pending_records.append(record)
+                    pending_texts.append(text)
+                
+                if len(pending_records) >= EMBEDDING_BATCH_SIZE:
+                    embeddings = embedder.encode_batch(pending_texts)
+                    
+                    with get_db_connection_ctx(DB_PATH) as conn:
+                        for rec, emb in zip(pending_records, embeddings):
+                            rec['embedding'] = emb
+                            insert_email(conn, rec)
+                        conn.commit()
+                    
+                    with state_lock:
+                        for rec in pending_records:
+                            processed_count += 1
+                            last_processed_path = rec.get('source_path', str(eml_path))
+                        
+                        if processed_count >= MAX_EMAILS:
+                            logger.info(f"Reached limit of {MAX_EMAILS} emails, stopping")
+                            stopped = True
+                    
+                    logger.info(f"Processed {processed_count}/{total_files} emails (including salvaged quotes)")
+                    
+                    pending_records = []
+                    pending_texts = []
+                
+                with state_lock:
+                    should_save = processed_count > 0 and processed_count % CHECKPOINT_INTERVAL == 0
+                
+                if should_save:
+                    checkpoint['processed_count'] = processed_count
+                    checkpoint['last_processed_path'] = last_processed_path
+                    checkpoint['errors'] = errors[:]
+                    save_checkpoint(checkpoint)
+            
+            except Exception as e:
+                logger.error(f"Error processing {eml_path}: {e}")
+                with state_lock:
+                    errors.append({
+                        'file_path': str(eml_path),
+                        'error_type': type(e).__name__,
+                        'error_message': str(e),
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    })
     
     if pending_records:
-        if owner_addresses:
-            for rec in pending_records:
-                rec['is_outbound'] = 1 if rec['from_address'].lower() in {a.lower() for a in owner_addresses} else 0
-        
         embeddings = embedder.encode_batch(pending_texts)
         
-        for rec, emb in zip(pending_records, embeddings):
-            rec['embedding'] = emb
-            insert_email(conn, rec)
+        with get_db_connection_ctx(DB_PATH) as conn:
+            for rec, emb in zip(pending_records, embeddings):
+                rec['embedding'] = emb
+                insert_email(conn, rec)
+            conn.commit()
         
-        conn.commit()
-        
-        for rec in pending_records:
-            checkpoint['processed_count'] += 1
-            checkpoint['last_processed_path'] = rec.get('source_path', '')
+        with state_lock:
+            for rec in pending_records:
+                processed_count += 1
+                last_processed_path = rec.get('source_path', '')
     
-    conn.close()
-    
+    checkpoint['processed_count'] = processed_count
+    checkpoint['last_processed_path'] = last_processed_path
     checkpoint['completed_at'] = datetime.now(timezone.utc).isoformat()
+    checkpoint['errors'] = errors
     save_checkpoint(checkpoint)
     
-    logger.info(f"Ingestion complete: {checkpoint['processed_count']} emails processed")
+    logger.info(f"Ingestion complete: {processed_count} emails processed")
     
-    errors = checkpoint.get('errors', [])
     if errors:
         error_types = {}
         for e in errors:
