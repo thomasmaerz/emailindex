@@ -1060,6 +1060,24 @@ def get_db_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+from contextlib import contextmanager
+
+@contextmanager
+def get_db_connection_ctx(db_path: Path):
+    """Get a DB connection with automatic cleanup. Usage: 'with get_db_connection_ctx(DB_PATH) as conn:'"""
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+    except Exception:
+        pass
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def collect_email_files(maildir_path: Path) -> list[tuple[Path, str]]:
     eml_files = []
     
