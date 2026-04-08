@@ -1166,7 +1166,7 @@ def insert_email(conn: sqlite3.Connection, record: dict):
             logger.warning(f"Could not insert vector: {e}")
 
 
-def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int = 4):
+def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int = 4, generate_embeddings: bool = True):
     init_database(DB_PATH)
     
     checkpoint = load_checkpoint()
@@ -1194,7 +1194,11 @@ def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int
         logger.info("No emails to process")
         return
     
-    embedder = Embedder()
+    embedder = None
+    if generate_embeddings:
+        embedder = Embedder()
+    else:
+        logger.info("Skipping embedding generation (--no-embeddings)")
     
     processed_count = checkpoint.get('processed_count', 0)
     last_processed_path = checkpoint.get('last_processed_path', '')
@@ -1274,16 +1278,19 @@ def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int
                 _, _, records = result
                 
                 for record in records:
-                    text = generate_embedding_text(record)
+                    if generate_embeddings:
+                        text = generate_embedding_text(record)
+                        pending_texts.append(text)
                     pending_records.append(record)
-                    pending_texts.append(text)
                 
-                if len(pending_records) >= EMBEDDING_BATCH_SIZE:
-                    embeddings = embedder.encode_batch(pending_texts)
-                    
-                    with get_db_connection_ctx(DB_PATH) as conn:
+                if len(pending_records) >= (EMBEDDING_BATCH_SIZE if generate_embeddings else 100):
+                    if generate_embeddings and embedder:
+                        embeddings = embedder.encode_batch(pending_texts)
                         for rec, emb in zip(pending_records, embeddings):
                             rec['embedding'] = emb
+                    
+                    with get_db_connection_ctx(DB_PATH) as conn:
+                        for rec in pending_records:
                             insert_email(conn, rec)
                         conn.commit()
                     
@@ -1321,11 +1328,13 @@ def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int
                     })
     
     if pending_records:
-        embeddings = embedder.encode_batch(pending_texts)
-        
-        with get_db_connection_ctx(DB_PATH) as conn:
+        if generate_embeddings and embedder:
+            embeddings = embedder.encode_batch(pending_texts)
             for rec, emb in zip(pending_records, embeddings):
                 rec['embedding'] = emb
+        
+        with get_db_connection_ctx(DB_PATH) as conn:
+            for rec in pending_records:
                 insert_email(conn, rec)
             conn.commit()
         
@@ -1495,10 +1504,98 @@ def run_backfill(backfill_type: str = "all"):
     print(f"\nBackfill complete: {updated} rows updated")
 
 
+def manage_embeddings(mode: str = "missing"):
+    """
+    Generate embeddings for emails in the database.
+    
+    Args:
+        mode: "missing" (backfill only) or "all" (replace all)
+    """
+    logger.info(f"Starting embedding management in mode: {mode}")
+    
+    with get_db_connection_ctx(DB_PATH) as conn:
+        cursor = conn.cursor()
+        
+        if mode == "all":
+            logger.info("Clearing existing embeddings...")
+            cursor.execute("UPDATE emails SET embedding = NULL")
+            try:
+                cursor.execute("DELETE FROM email_vectors")
+            except Exception as e:
+                logger.warning(f"Could not clear email_vectors: {e}")
+            conn.commit()
+        
+        # Select records that need embeddings
+        query = """
+            SELECT id, subject, from_name, from_address, timestamp, body_markdown 
+            FROM emails 
+            WHERE embedding IS NULL
+        """
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        
+    if not rows:
+        logger.info("No emails found that need embeddings.")
+        return
+
+    logger.info(f"Found {len(rows)} emails to embed.")
+    
+    embedder = Embedder()
+    
+    batch_size = EMBEDDING_BATCH_SIZE
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        batch_records = []
+        batch_texts = []
+        
+        for row in batch:
+            record = {
+                'id': row[0],
+                'subject': row[1],
+                'from_name': row[2],
+                'from_address': row[3],
+                'timestamp': row[4],
+                'body_markdown': row[5]
+            }
+            batch_records.append(record)
+            batch_texts.append(generate_embedding_text(record))
+        
+        try:
+            embeddings = embedder.encode_batch(batch_texts)
+            
+            with get_db_connection_ctx(DB_PATH) as conn:
+                cursor = conn.cursor()
+                for record, emb in zip(batch_records, embeddings):
+                    cursor.execute("UPDATE emails SET embedding = ? WHERE id = ?", (emb, record['id']))
+                    try:
+                        cursor.execute(
+                            "INSERT INTO email_vectors (email_id, embedding) VALUES (?, ?)",
+                            (record['id'], emb)
+                        )
+                    except Exception:
+                        # Fallback for duplicates or other vector table issues
+                        cursor.execute("DELETE FROM email_vectors WHERE email_id = ?", (record['id'],))
+                        cursor.execute(
+                            "INSERT INTO email_vectors (email_id, embedding) VALUES (?, ?)",
+                            (record['id'], emb)
+                        )
+                conn.commit()
+            
+            if (i + len(batch)) % 100 == 0 or (i + len(batch)) == len(rows):
+                logger.info(f"Embedded {i + len(batch)}/{len(rows)} emails")
+                
+        except Exception as e:
+            logger.error(f"Error processing batch starting at {i}: {e}")
+            continue
+
+    logger.info("Embedding management complete.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Ingest emails from Maildir or run backfill")
     parser.add_argument("maildir", nargs="?", type=Path, help="Path to Maildir directory")
     parser.add_argument("--no-resume", action="store_true", help="Start fresh, don't resume from checkpoint")
+    parser.add_argument("--no-embeddings", action="store_true", help="Skip embedding generation")
     parser.add_argument("--backfill", nargs="?", const="all", help="Run backfill on existing DB (default: all, or specify: is_outbound, categories, projects, etc.)")
     parser.add_argument(
         "--concurrent-limit",
@@ -1527,7 +1624,12 @@ def main():
     
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     
-    ingest_emails(args.maildir, resume=not args.no_resume, concurrent_limit=args.concurrent_limit)
+    ingest_emails(
+        args.maildir, 
+        resume=not args.no_resume, 
+        concurrent_limit=args.concurrent_limit,
+        generate_embeddings=not args.no_embeddings
+    )
 
 
 if __name__ == "__main__":
