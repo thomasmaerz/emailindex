@@ -1499,6 +1499,10 @@ def run_backfill(backfill_type: str = "all"):
             updated += count
         else:
             print("No projects in registry, skipping project_tags backfill")
+
+    if backfill_type in ("all", "embeddings"):
+        manage_embeddings(mode="missing")
+        updated += 1
     
     conn.close()
     print(f"\nBackfill complete: {updated} rows updated")
@@ -1597,6 +1601,8 @@ def main():
     parser.add_argument("--no-resume", action="store_true", help="Start fresh, don't resume from checkpoint")
     parser.add_argument("--no-embeddings", action="store_true", help="Skip embedding generation")
     parser.add_argument("--backfill", nargs="?", const="all", help="Run backfill on existing DB (default: all, or specify: is_outbound, categories, projects, etc.)")
+    parser.add_argument("--backfill-embeddings", action="store_true", help="Generate missing embeddings for existing records")
+    parser.add_argument("--re-embed", action="store_true", help="Clear and re-generate all embeddings")
     parser.add_argument(
         "--concurrent-limit",
         type=int,
@@ -1606,6 +1612,14 @@ def main():
     
     args = parser.parse_args()
     
+    if args.backfill_embeddings:
+        manage_embeddings(mode="missing")
+        return
+        
+    if args.re_embed:
+        manage_embeddings(mode="all")
+        return
+
     if args.backfill:
         from mcp_server.config import Config
         if args.backfill == "all":
