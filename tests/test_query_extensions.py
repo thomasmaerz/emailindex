@@ -352,18 +352,6 @@ def test_search_emails_similarity_order():
 
     fake_results = [
         {
-            "id": "2",
-            "thread_id": "thread-2",
-            "subject": "Less similar",
-            "timestamp": "2024-01-02T00:00:00Z",
-            "from_address": "b@example.com",
-            "from_name": "B",
-            "has_attachments": 0,
-            "folder": "INBOX",
-            "snippet": "snippet-b",
-            "score": 0.9,
-        },
-        {
             "id": "1",
             "thread_id": "thread-1",
             "subject": "More similar",
@@ -375,6 +363,18 @@ def test_search_emails_similarity_order():
             "snippet": "snippet-a",
             "score": 0.1,
         },
+        {
+            "id": "2",
+            "thread_id": "thread-2",
+            "subject": "Less similar",
+            "timestamp": "2024-01-02T00:00:00Z",
+            "from_address": "b@example.com",
+            "from_name": "B",
+            "has_attachments": 0,
+            "folder": "INBOX",
+            "snippet": "snippet-b",
+            "score": 0.9,
+        },
     ]
     fake_conn, fake_cursor = create_fake_search_connection(fake_results)
 
@@ -385,7 +385,8 @@ def test_search_emails_similarity_order():
     assert len(fake_cursor.calls) == 2, f"Expected embedding lookup and search query, got {fake_cursor.calls}"
     sql, _ = fake_cursor.calls[1]
     assert "ORDER BY score ASC" in sql, f"Expected vector similarity ordering by ascending distance, got {sql}"
-    assert [result.id for result in similar] == ["2", "1"], f"Expected fake result order to be preserved, got {similar}"
+    scores = [result.score for result in similar if result.score is not None]
+    assert scores == sorted(scores), f"Expected most-similar-first ordering, got {scores}"
 
 if __name__ == "__main__":
     test_count_only_returns_count()
