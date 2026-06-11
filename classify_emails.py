@@ -4,6 +4,7 @@
 import json
 import logging
 import os
+import argparse
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -111,16 +112,20 @@ def call_gemini(prompt: str, max_retries: int = BATCH_RETRIES) -> Optional[str]:
     return None
 
 
-def discover_projects(checkpoint: dict) -> int:
+def discover_projects(checkpoint: dict, reset_registry: bool = False) -> int:
     logger.info("Starting project discovery phase...")
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    if reset_registry:
+        logger.info("Resetting project_registry before discovery")
+        cursor.execute("DELETE FROM project_registry")
+
     cursor.execute("""
-        SELECT DISTINCT subject, COALESCE(NULLIF(body_text, ''), body_plain, body_markdown) AS body_text 
+        SELECT subject, body_text
         FROM emails 
-        WHERE COALESCE(NULLIF(body_text, ''), body_plain, body_markdown) IS NOT NULL AND COALESCE(NULLIF(body_text, ''), body_plain, body_markdown) != ''
-        ORDER BY timestamp DESC
+        WHERE body_text IS NOT NULL AND length(body_text) > 100
+        ORDER BY RANDOM()
         LIMIT 500
     """)
     rows = cursor.fetchall()
@@ -195,7 +200,7 @@ def classify_emails(checkpoint: dict) -> int:
     query = """
         SELECT id, subject, COALESCE(NULLIF(body_text, ''), body_plain, body_markdown) AS body_text, sender, recipients, timestamp
         FROM emails
-        WHERE (category_tags IS NULL OR category_tags = '')
+        WHERE (project_tags IS NULL OR project_tags = '[]' OR project_tags = '')
     """
 
     params = ()
@@ -310,13 +315,13 @@ Output a JSON array with:
     return classified
 
 
-def run_classification():
+def run_classification(reset_registry: bool = False):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     checkpoint = load_checkpoint()
 
     if not checkpoint.get("discover_phase_done"):
-        discover_projects(checkpoint)
+        discover_projects(checkpoint, reset_registry=reset_registry)
         save_checkpoint(checkpoint)
 
     classified_count = 0
@@ -332,5 +337,16 @@ def run_classification():
     logger.info(f"Classification complete! Total classified: {classified_count}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Batch classify emails with Gemini")
+    parser.add_argument(
+        "--reset-registry",
+        action="store_true",
+        help="Truncate project_registry before rediscovering projects",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    run_classification()
+    args = parse_args()
+    run_classification(reset_registry=args.reset_registry)

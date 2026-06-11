@@ -165,6 +165,42 @@ def close_connection():
         _thread_local.conn = None
 
 
+def ensure_email_category_fts(cursor: sqlite3.Cursor) -> None:
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='email_category_fts'")
+    if cursor.fetchone():
+        return
+
+    cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS email_category_fts USING fts5(
+            category_tags,
+            project_tags,
+            content='emails'
+        )
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS emails_ai AFTER INSERT ON emails BEGIN
+            INSERT INTO email_category_fts(rowid, category_tags, project_tags)
+            VALUES (new.rowid, new.category_tags, new.project_tags);
+        END
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS emails_ad AFTER DELETE ON emails BEGIN
+            INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags)
+            VALUES('delete', old.rowid, old.category_tags, old.project_tags);
+        END
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS emails_au AFTER UPDATE ON emails BEGIN
+            INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags)
+            VALUES('delete', old.rowid, old.category_tags, old.project_tags);
+            INSERT INTO email_category_fts(rowid, category_tags, project_tags)
+            VALUES (new.rowid, new.category_tags, new.project_tags);
+        END
+    """)
+    cursor.execute("INSERT INTO email_category_fts(email_category_fts) VALUES('rebuild')")
+    cursor.connection.commit()
+
+
 def decompress_eml(compressed_bytes: bytes) -> bytes:
     decompressor = zstd.ZstdDecompressor()
     return decompressor.decompress(compressed_bytes)
@@ -800,6 +836,7 @@ def query_email_database(
 def get_project_context(project_name: str, limit: int = 10) -> Optional[dict]:
     conn = get_connection()
     cursor = conn.cursor()
+    ensure_email_category_fts(cursor)
     
     cursor.execute("""
         SELECT name, aliases, summary, created_at
@@ -819,16 +856,19 @@ def get_project_context(project_name: str, limit: int = 10) -> Optional[dict]:
         "created_at": row["created_at"]
     }
     
+    fts_query = f'project_tags:"{row["name"]}"'
+
     cursor.execute("""
         SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                e.category_tags, e.project_tags, e.has_attachments, e.folder,
                COALESCE(e.body_text, e.body_markdown) as body_text
         FROM emails e
-        WHERE e.project_tags LIKE ?
+        JOIN email_category_fts ecf ON e.rowid = ecf.rowid
+        WHERE email_category_fts MATCH ?
           AND (e.source IS NULL OR e.source != 'quoted_reply')
         ORDER BY e.timestamp DESC
         LIMIT ?
-    """, (f"%{row['name']}%", limit))
+    """, (fts_query, limit))
     
     results = []
     for row in cursor.fetchall():
