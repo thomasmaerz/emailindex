@@ -7,6 +7,7 @@ import sys
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock, mock_open
 
@@ -67,7 +68,7 @@ class TestClassifyEmailsPagination(unittest.TestCase):
         query = """
             SELECT id, subject, COALESCE(NULLIF(body_text, ''), body_plain, body_markdown) AS body, sender, recipients, timestamp
             FROM emails
-            WHERE (category_tags IS NULL OR category_tags = '')
+            WHERE (project_tags IS NULL OR project_tags = '[]' OR project_tags = '')
         """
 
         params = ()
@@ -255,6 +256,266 @@ class TestCheckpointBackwardCompat(unittest.TestCase):
                 self.assertEqual(checkpoint.get("last_email_id"), "some-uuid")
         finally:
             os.unlink(temp_path)
+
+
+class TestProjectTagClassificationSource(unittest.TestCase):
+    """Tests classification source selection and discovery reset behavior."""
+
+    def setUp(self):
+        temp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.addCleanup(lambda path=temp_db.name: os.path.exists(path) and os.unlink(path))
+        temp_db.close()
+        self.temp_db = temp_db.name
+        self.conn = sqlite3.connect(self.temp_db)
+        self.conn.row_factory = sqlite3.Row
+        self.cursor = self.conn.cursor()
+        self.cursor.execute("""
+            CREATE TABLE emails (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                body_text TEXT,
+                body_markdown TEXT,
+                body_plain TEXT,
+                sender TEXT,
+                recipients TEXT,
+                timestamp TEXT NOT NULL,
+                category_tags TEXT,
+                project_tags TEXT
+            )
+        """)
+        self.cursor.execute("""
+            CREATE TABLE project_registry (
+                name TEXT PRIMARY KEY,
+                aliases TEXT,
+                summary TEXT,
+                created_at TEXT
+            )
+        """)
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_query_targets_missing_project_tags_not_category_tags(self):
+        self.cursor.execute(
+            "INSERT INTO project_registry (name, aliases, summary, created_at) VALUES (?, ?, ?, ?)",
+            ("Alpha", "", "alpha project", "2024-01-01T00:00:00Z"),
+        )
+        self.cursor.execute(
+            """
+            INSERT INTO emails (id, subject, body_text, body_markdown, body_plain, sender, recipients, timestamp, category_tags, project_tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("needs-project-tags", "Tagged category only", "body" * 50, "", "", "a@test.com", "b@test.com", "2024-01-01T00:00:00Z", '["work"]', '[]'),
+        )
+        self.cursor.execute(
+            """
+            INSERT INTO emails (id, subject, body_text, body_markdown, body_plain, sender, recipients, timestamp, category_tags, project_tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("already-has-project-tags", "Has project tag", "body" * 50, "", "", "a@test.com", "b@test.com", "2024-01-02T00:00:00Z", None, '["Alpha"]'),
+        )
+        self.conn.commit()
+
+        checkpoint = {"last_timestamp": None, "last_email_id": None, "emails_classified": 0}
+
+        gemini_response = json.dumps([
+            {"id": "needs-project-tags", "category_tags": "work", "project_tags": "Alpha"}
+        ])
+
+        with patch.object(ce, 'DB_PATH', Path(self.temp_db)), \
+             patch.object(ce, 'BATCH_SIZE', 100), \
+             patch.object(ce, 'call_gemini', return_value=gemini_response) as mock_call_gemini:
+            classified = ce.classify_emails(checkpoint)
+
+        self.assertEqual(classified, 1)
+        prompt = mock_call_gemini.call_args.args[0]
+        self.assertIn('"id": "needs-project-tags"', prompt)
+        self.assertNotIn('"id": "already-has-project-tags"', prompt)
+
+        self.cursor.execute("SELECT project_tags FROM emails WHERE id = ?", ("needs-project-tags",))
+        self.assertEqual(self.cursor.fetchone()[0], '["Alpha"]')
+
+        self.cursor.execute("SELECT project_tags FROM emails WHERE id = ?", ("already-has-project-tags",))
+        self.assertEqual(self.cursor.fetchone()[0], '["Alpha"]')
+
+    def test_discover_projects_reset_registry_truncates_before_insert(self):
+        self.cursor.execute(
+            "INSERT INTO project_registry (name, aliases, summary, created_at) VALUES (?, ?, ?, ?)",
+            ("Legacy", "", "old", "2024-01-01T00:00:00Z"),
+        )
+        self.cursor.execute(
+            """
+            INSERT INTO emails (id, subject, body_text, body_markdown, body_plain, sender, recipients, timestamp, category_tags, project_tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("sample", "Discovery sample", "x" * 200, "", "", "a@test.com", "b@test.com", "2024-01-01T00:00:00Z", None, None),
+        )
+        self.conn.commit()
+
+        checkpoint = {"discover_phase_done": False, "projects_discovered": 0}
+
+        with patch.object(ce, 'DB_PATH', Path(self.temp_db)), \
+             patch.object(ce, 'call_gemini', return_value=json.dumps([
+                  {"name": "Fresh", "aliases": ["NewAlias"], "summary": "new"}
+              ])):
+            discovered = ce.discover_projects(checkpoint, reset_registry=True)
+
+        self.assertEqual(discovered, 1)
+        self.cursor.execute("SELECT name FROM project_registry ORDER BY name")
+        self.assertEqual([row[0] for row in self.cursor.fetchall()], ["Fresh"])
+
+    def test_discover_projects_reset_registry_rolls_back_on_parse_failure(self):
+        self.cursor.execute(
+            "INSERT INTO project_registry (name, aliases, summary, created_at) VALUES (?, ?, ?, ?)",
+            ("Legacy", "", "old", "2024-01-01T00:00:00Z"),
+        )
+        self.cursor.execute(
+            """
+            INSERT INTO emails (id, subject, body_text, body_markdown, body_plain, sender, recipients, timestamp, category_tags, project_tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("sample", "Discovery sample", "x" * 200, "", "", "a@test.com", "b@test.com", "2024-01-01T00:00:00Z", None, None),
+        )
+        self.conn.commit()
+
+        checkpoint = {"discover_phase_done": False, "projects_discovered": 0}
+
+        with patch.object(ce, 'DB_PATH', Path(self.temp_db)), \
+             patch.object(ce, 'call_gemini', return_value='not-json'):
+            discovered = ce.discover_projects(checkpoint, reset_registry=True)
+
+        self.assertEqual(discovered, 0)
+        self.cursor.execute("SELECT name FROM project_registry ORDER BY name")
+        self.assertEqual([row[0] for row in self.cursor.fetchall()], ["Legacy"])
+
+
+class TestProjectContextFTS(unittest.TestCase):
+    """Tests project context uses FTS-backed project tag lookup."""
+
+    def setUp(self):
+        temp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.addCleanup(lambda path=temp_db.name: os.path.exists(path) and os.unlink(path))
+        temp_db.close()
+        self.temp_db = temp_db.name
+        self.conn = sqlite3.connect(self.temp_db)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute("""
+            CREATE TABLE emails (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT,
+                subject TEXT,
+                timestamp TEXT,
+                from_address TEXT,
+                category_tags TEXT,
+                project_tags TEXT,
+                has_attachments INTEGER,
+                folder TEXT,
+                body_text TEXT,
+                body_markdown TEXT,
+                source TEXT
+            )
+        """)
+        self.cursor.execute("""
+            CREATE TABLE project_registry (
+                name TEXT PRIMARY KEY,
+                aliases TEXT,
+                summary TEXT,
+                created_at TEXT
+            )
+        """)
+        self.cursor.execute(
+            "INSERT INTO project_registry (name, aliases, summary, created_at) VALUES (?, ?, ?, ?)",
+            ("Alpha", "A1", "alpha summary", datetime.now(timezone.utc).isoformat()),
+        )
+        self.cursor.executemany(
+            """
+            INSERT INTO emails (id, thread_id, subject, timestamp, from_address, category_tags, project_tags, has_attachments, folder, body_text, body_markdown, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("exact", "thread-1", "Exact match", "2024-01-02T00:00:00Z", "a@test.com", '["work"]', '["Alpha"]', 0, "INBOX", "exact body", None, "original"),
+                ("partial", "thread-2", "Partial only", "2024-01-03T00:00:00Z", "b@test.com", '["work"]', '["AlphaX"]', 0, "INBOX", "partial body", None, "original"),
+            ],
+        )
+        self.cursor.execute("""
+            CREATE VIRTUAL TABLE email_category_fts USING fts5(
+                category_tags,
+                project_tags,
+                content='emails'
+            )
+        """)
+        self.cursor.execute("INSERT INTO email_category_fts(email_category_fts) VALUES('rebuild')")
+        self.conn.commit()
+
+    def tearDown(self):
+        from mcp_server import database as db
+
+        db.close_connection()
+        self.conn.close()
+
+    def test_get_project_context_uses_exact_project_tag_fts_match(self):
+        from mcp_server.config import Config
+        from mcp_server import database as db
+
+        original_db = Config.DB_PATH
+        try:
+            Config.DB_PATH = Path(self.temp_db)
+            db.close_connection()
+            result = db.get_project_context("Alpha", limit=10)
+        finally:
+            db.close_connection()
+            Config.DB_PATH = original_db
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual([email["id"] for email in result["emails"]], ["exact"])
+
+    def test_ensure_email_category_fts_recreates_missing_triggers(self):
+        from mcp_server import database as db
+
+        self.cursor.execute("DROP TRIGGER IF EXISTS emails_ai")
+        self.cursor.execute("DROP TRIGGER IF EXISTS emails_ad")
+        self.cursor.execute("DROP TRIGGER IF EXISTS emails_au")
+        self.conn.commit()
+
+        db.ensure_email_category_fts(self.cursor)
+
+        self.cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('emails_ai', 'emails_ad', 'emails_au') ORDER BY name"
+        )
+        self.assertEqual([row[0] for row in self.cursor.fetchall()], ["emails_ad", "emails_ai", "emails_au"])
+
+    def test_get_project_context_escapes_fts_special_characters(self):
+        from mcp_server.config import Config
+        from mcp_server import database as db
+
+        self.cursor.execute(
+            "INSERT INTO project_registry (name, aliases, summary, created_at) VALUES (?, ?, ?, ?)",
+            ('Alpha "Beta"', '', 'quoted project', datetime.now(timezone.utc).isoformat()),
+        )
+        self.cursor.execute(
+            """
+            INSERT INTO emails (id, thread_id, subject, timestamp, from_address, category_tags, project_tags, has_attachments, folder, body_text, body_markdown, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("quoted", "thread-3", "Quoted project", "2024-01-04T00:00:00Z", "c@test.com", '["work"]', '["Alpha \"Beta\""]', 0, "INBOX", "quoted body", None, "original"),
+        )
+        self.cursor.execute("INSERT INTO email_category_fts(email_category_fts) VALUES('rebuild')")
+        self.conn.commit()
+
+        original_db = Config.DB_PATH
+        try:
+            Config.DB_PATH = Path(self.temp_db)
+            db.close_connection()
+            result = db.get_project_context('Alpha "Beta"', limit=10)
+        finally:
+            db.close_connection()
+            Config.DB_PATH = original_db
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual([email["id"] for email in result["emails"]], ["quoted"])
 
 
 class TestParameterizedQuery(unittest.TestCase):
