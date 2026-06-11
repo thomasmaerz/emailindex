@@ -38,6 +38,12 @@ The Email Intelligence System parses personal email archives into a queryable SQ
 | `HF_HUB_OFFLINE` | `1` | Set to `1` (default) to use cached model only and avoid HuggingFace Hub network checks. Set to `0` to allow model update checks (requires internet + optional `HF_TOKEN`). When `HF_HUB_OFFLINE=0`, unauthenticated Hub checks can hit rate limits and may cause first-query hangs/timeouts. |
 | `HF_TOKEN` | — | Optional HuggingFace token for authenticated Hub access when `HF_HUB_OFFLINE=0`. Set this for online mode to avoid unauthenticated rate-limit stalls. |
 
+## Known Limitations
+
+| Limitation | Impact | Tracking |
+|------------|--------|---------|
+| Vector search (sqlite-vec) uses brute-force scan — no ANN index | ~3-5s per semantic query on 81K emails; degrades linearly | Upstream: https://github.com/asg017/sqlite-vec |
+
 ---
 
 ## 2. Directory Structure
