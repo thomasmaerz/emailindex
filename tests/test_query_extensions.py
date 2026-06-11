@@ -195,7 +195,10 @@ def test_semantic_query_with_filters_applies_shared_where_clause():
     assert result["results"] == [], f"Expected empty semantic result set from fake cursor, got {result}"
     assert len(fake_cursor.calls) == 1, f"Expected exactly one semantic query execution, got {fake_cursor.calls}"
     sql, params = fake_cursor.calls[0]
-    assert "category_tags" in sql and "project_tags" in sql, f"Expected semantic SQL to reuse filter WHERE clauses, got {sql}"
+    assert "category_tags" in sql, f'Expected "category_tags" in SQL, got {sql}'
+    assert "project_tags" in sql, f'Expected "project_tags" in SQL, got {sql}'
+    # Tags appear twice because the shared WHERE clause binds the same tag list
+    # once for category_tags and once again for project_tags.
     assert params == [b"fake-embedding", "%finance%", "%alpha%", "%finance%", "%alpha%", 10], (
         f"Expected semantic params to include shared filter placeholders, got {params}"
     )
