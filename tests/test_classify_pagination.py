@@ -67,7 +67,7 @@ class TestClassifyEmailsPagination(unittest.TestCase):
         query = """
             SELECT id, subject, COALESCE(NULLIF(body_text, ''), body_plain, body_markdown) AS body, sender, recipients, timestamp
             FROM emails
-            WHERE category_tags IS NULL OR category_tags = ''
+            WHERE (category_tags IS NULL OR category_tags = '')
         """
 
         params = ()
@@ -81,6 +81,12 @@ class TestClassifyEmailsPagination(unittest.TestCase):
         self.cursor.execute(query, params)
         rows = self.cursor.fetchall()
         return [dict(r) for r in rows]
+
+    def _insert_sample_emails(self):
+        """Insert a small ordered dataset for checkpoint tests."""
+        self._insert_email("id-01", "Subject 1", "2024-01-01T00:00:00Z")
+        self._insert_email("id-02", "Subject 2", "2024-01-02T00:00:00Z")
+        self._insert_email("id-03", "Subject 3", "2024-01-03T00:00:00Z")
 
     def test_full_traversal_no_skips(self):
         """Multiple batches across M emails — every email classified exactly once."""
@@ -150,21 +156,21 @@ class TestClassifyEmailsPagination(unittest.TestCase):
 
     def test_checkpoint_backward_compat_fresh(self):
         """Fresh checkpoint starts from beginning."""
+        self._insert_sample_emails()
         checkpoint = {"last_timestamp": None, "last_email_id": None}
         rows = self._build_classify_query(checkpoint, batch_size=10)
         self.assertEqual(len(rows), 3)
 
     def test_checkpoint_backward_compat_old_uuid_format(self):
         """Old UUID-only format triggers reset (no last_timestamp)."""
+        self._insert_sample_emails()
         checkpoint = {"last_email_id": "some-old-uuid", "last_timestamp": None}
         rows = self._build_classify_query(checkpoint, batch_size=10)
         self.assertEqual(len(rows), 3)
 
     def test_checkpoint_backward_compat_valid_v2(self):
         """Valid v2 checkpoint resumes from correct position."""
-        self._insert_email("id-01", "Subject 1", "2024-01-01T00:00:00Z")
-        self._insert_email("id-02", "Subject 2", "2024-01-02T00:00:00Z")
-        self._insert_email("id-03", "Subject 3", "2024-01-03T00:00:00Z")
+        self._insert_sample_emails()
 
         checkpoint = {"last_timestamp": "2024-01-02T00:00:00Z", "last_email_id": "id-02"}
         rows = self._build_classify_query(checkpoint, batch_size=10)
