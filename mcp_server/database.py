@@ -109,17 +109,19 @@ def _load_embedding_model() -> None:
 
 
 def initialize_embedding_model_async() -> None:
-    global _embedding_model_loading
+    global _embedding_model_loading, _embedding_model_load_error
     with _embedding_model_lock:
-        if _embedding_model is not None or _embedding_model_loading or _embedding_model_load_error is not None:
+        if _embedding_model is not None or _embedding_model_loading:
             return
+        if _embedding_model_load_error is not None:
+            _embedding_model_load_error = None
         _embedding_model_loading = True
         thread = threading.Thread(target=_load_embedding_model, name="embedding-model-loader", daemon=True)
         thread.start()
 
 
 def _get_embedding_model():
-    global _embedding_model_loading
+    global _embedding_model_loading, _embedding_model_load_error
     with _embedding_model_lock:
         if _embedding_model is not None:
             return _embedding_model
@@ -530,20 +532,20 @@ def query_email_database(
         except Exception as e:
             close_connection()
             return {"error": f"Failed to encode semantic query: {e}", "results": []}
-        
-        sql = """
+
+        sql = f"""
             SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
                    e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
                    COALESCE(e.body_text, e.body_markdown) as body_text,
                    vec_distance_cosine(ev.embedding, ?) as relevance_score
             FROM emails e
             JOIN email_vectors ev ON e.id = ev.email_id
-            WHERE (e.source IS NULL OR e.source != 'quoted_reply')
+            WHERE {where_sql}
             ORDER BY relevance_score ASC
             LIMIT ?
         """
-        semantic_params = [query_embedding, limit]
-        
+        semantic_params = [query_embedding] + list(params) + [limit]
+
         cursor_conn.execute(sql, semantic_params)
         results = cursor_conn.fetchall()
         
