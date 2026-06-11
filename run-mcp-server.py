@@ -4,6 +4,8 @@ import os
 import time
 import json
 
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 with open('/tmp/mcp_start.log', 'a') as f:
     f.write(f'START at {time.time()}\n')
     f.write(f'argv: {sys.argv}\n')
