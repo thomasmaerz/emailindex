@@ -193,7 +193,7 @@ def classify_emails(checkpoint: dict) -> int:
     query = """
         SELECT id, subject, COALESCE(NULLIF(body_text, ''), body_plain, body_markdown) AS body_text, sender, recipients, timestamp
         FROM emails
-        WHERE category_tags IS NULL OR category_tags = ''
+        WHERE (category_tags IS NULL OR category_tags = '')
     """
 
     params = ()

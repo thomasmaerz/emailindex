@@ -707,7 +707,7 @@ def init_database(db_path: Path):
     cursor.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
             subject,
-            body_markdown,
+            body_text,
             content='emails',
             content_rowid='rowid'
         )
@@ -715,20 +715,20 @@ def init_database(db_path: Path):
     
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS emails_fts_insert AFTER INSERT ON emails BEGIN
-            INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (NEW.rowid, NEW.subject, NEW.body_markdown);
+            INSERT INTO emails_fts(rowid, subject, body_text) VALUES (NEW.rowid, NEW.subject, NEW.body_text);
         END
     """)
     
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS emails_fts_delete AFTER DELETE ON emails BEGIN
-            INSERT INTO emails_fts(emails_fts, rowid, subject, body_markdown) VALUES('delete', OLD.rowid, OLD.subject, OLD.body_markdown);
+            INSERT INTO emails_fts(emails_fts, rowid, subject, body_text) VALUES('delete', OLD.rowid, OLD.subject, OLD.body_text);
         END
     """)
     
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS emails_fts_update AFTER UPDATE ON emails BEGIN
-            INSERT INTO emails_fts(emails_fts, rowid, subject, body_markdown) VALUES('delete', OLD.rowid, OLD.subject, OLD.body_markdown);
-            INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (NEW.rowid, NEW.subject, NEW.body_markdown);
+            INSERT INTO emails_fts(emails_fts, rowid, subject, body_text) VALUES('delete', OLD.rowid, OLD.subject, OLD.body_text);
+            INSERT INTO emails_fts(rowid, subject, body_text) VALUES (NEW.rowid, NEW.subject, NEW.body_text);
         END
     """)
     
@@ -999,7 +999,18 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
             body_markdown = plain_body or ""
         
         parent_record['body_markdown'] = body_markdown.strip()
-        parent_record['body_text'] = body_markdown.strip()
+        if html_body:
+            html_text = Converter.extract_text_from_html(html_body).strip()
+            if html_text:
+                parent_record['body_text'] = html_text
+            elif plain_body:
+                parent_record['body_text'] = plain_body.strip()
+            else:
+                parent_record['body_text'] = body_markdown.strip()
+        elif plain_body:
+            parent_record['body_text'] = plain_body.strip()
+        else:
+            parent_record['body_text'] = body_markdown.strip()
         
         tags = classify_email(parent_record)
         parent_record['category_tags'] = json.dumps(tags)
