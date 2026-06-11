@@ -61,6 +61,7 @@ def test_get_email_excludes_raw_eml():
         assert result.raw_eml is None, f"raw_eml should be None, got {type(result.raw_eml)}"
         print("✓ test_get_email_excludes_raw_eml passed")
     finally:
+        close_connection()
         Config.DB_PATH = original_db
         os.unlink(path)
 
@@ -68,6 +69,7 @@ def test_get_email_excludes_embedding():
     path = create_test_db()
     original_db = Config.DB_PATH
     try:
+        update_test_blobs(path)
         Config.DB_PATH = Path(path)
 
         result = get_email("550e8400-e29b-41d4-a716-446655440000")
@@ -76,6 +78,7 @@ def test_get_email_excludes_embedding():
         assert "embedding" not in dumped, f"embedding should not be in response, got keys: {dumped.keys()}"
         print("✓ test_get_email_excludes_embedding passed")
     finally:
+        close_connection()
         Config.DB_PATH = original_db
         os.unlink(path)
 

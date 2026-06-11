@@ -111,22 +111,24 @@ def _load_embedding_model() -> None:
 def initialize_embedding_model_async() -> None:
     global _embedding_model_loading
     with _embedding_model_lock:
-        if _embedding_model is not None or _embedding_model_loading:
+        if _embedding_model is not None or _embedding_model_loading or _embedding_model_load_error is not None:
             return
         _embedding_model_loading = True
-
-    thread = threading.Thread(target=_load_embedding_model, name="embedding-model-loader", daemon=True)
-    thread.start()
+        thread = threading.Thread(target=_load_embedding_model, name="embedding-model-loader", daemon=True)
+        thread.start()
 
 
 def _get_embedding_model():
-    if _embedding_model is not None:
-        return _embedding_model
-
-    initialize_embedding_model_async()
-
-    if _embedding_model_load_error is not None:
-        raise RuntimeError(f"Embedding model failed to initialize: {_embedding_model_load_error}")
+    global _embedding_model_loading
+    with _embedding_model_lock:
+        if _embedding_model is not None:
+            return _embedding_model
+        if _embedding_model_load_error is not None:
+            raise RuntimeError(f"Embedding model failed to initialize: {_embedding_model_load_error}")
+        if not _embedding_model_loading:
+            _embedding_model_loading = True
+            thread = threading.Thread(target=_load_embedding_model, name="embedding-model-loader", daemon=True)
+            thread.start()
 
     raise RuntimeError("Embedding model is still initializing. Retry semantic query shortly.")
 
@@ -919,7 +921,7 @@ def get_mention_timeline(
 
     cursor.execute(f"""
         SELECT {period_expr} as period, COUNT(*) as count
-        FROM emails e
+        {from_clause}
         WHERE {where_sql}
         GROUP BY period
         ORDER BY period

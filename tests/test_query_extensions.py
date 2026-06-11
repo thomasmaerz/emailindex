@@ -141,15 +141,16 @@ def test_semantic_query_returns_timeout_error_without_loading_model():
 
 
 def test_get_embedding_model_returns_initializing_error_without_blocking():
-    with patch("mcp_server.database.initialize_embedding_model_async") as init_mock, \
+    with patch("mcp_server.database.threading.Thread") as thread_mock, \
          patch("mcp_server.database._embedding_model", None), \
-         patch("mcp_server.database._embedding_model_load_error", None):
+         patch("mcp_server.database._embedding_model_load_error", None), \
+         patch("mcp_server.database._embedding_model_loading", False):
         try:
             _get_embedding_model()
             assert False, "Expected initialization-in-progress error"
         except RuntimeError as exc:
             assert "still initializing" in str(exc), f"Unexpected error: {exc}"
-        init_mock.assert_called_once()
+        thread_mock.assert_called_once()
 
 if __name__ == "__main__":
     test_count_only_returns_count()
@@ -160,4 +161,5 @@ if __name__ == "__main__":
     test_tag_filters_bind_all_placeholders()
     test_fts_snippet_query_uses_join_alias()
     test_semantic_query_returns_timeout_error_without_loading_model()
+    test_get_embedding_model_returns_initializing_error_without_blocking()
     print("\n✅ All query extension tests passed!")
