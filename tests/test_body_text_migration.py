@@ -1,5 +1,14 @@
 import pytest
 import sqlite3
+import sys
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+BASE_DIR = Path(__file__).parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+import migrate_body_text
 
 from migrate_body_text import markdown_contains_formatting, markdown_to_plain_text
 from tests.validate_body_text import count_markdown_copies
@@ -73,3 +82,27 @@ def test_count_markdown_copies_ignores_non_transforming_angle_brackets_and_sheba
 
     assert count_markdown_copies(conn) == 1
     conn.close()
+
+
+def test_main_backfills_before_rebuilding_fts():
+    order = []
+    conn = Mock()
+    cursor = Mock()
+    conn.cursor.return_value = cursor
+
+    def record(name, return_value=None):
+        def _recorder(*args, **kwargs):
+            order.append(name)
+            return return_value
+        return _recorder
+
+    with patch.object(type(migrate_body_text.DB_PATH), "exists", return_value=True), \
+         patch.object(migrate_body_text.sqlite3, "connect", return_value=conn), \
+         patch.object(migrate_body_text, "fts_uses_body_text", return_value=False), \
+         patch.object(migrate_body_text, "backfill_body_text", side_effect=record("backfill", 12)), \
+         patch.object(migrate_body_text, "drop_fts_objects", side_effect=record("drop")), \
+         patch.object(migrate_body_text, "create_fts_objects", side_effect=record("create")), \
+         patch.object(migrate_body_text, "rebuild_fts", side_effect=record("rebuild")):
+        migrate_body_text.main()
+
+    assert order == ["backfill", "drop", "create", "rebuild"]

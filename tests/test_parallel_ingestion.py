@@ -134,6 +134,43 @@ class TestParallelIngestionWithMock(unittest.TestCase):
             self.assertIn('concurrent_limit', sig.parameters)
 
 
+class TestBodyTextFallbacks(unittest.TestCase):
+    """Test body_text fallback behavior during parsing."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.eml_path = Path(self.temp_dir) / "test.eml"
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_html_without_extractable_text_falls_back_to_plain_body(self):
+        self.eml_path.write_text(
+            "From: sender@example.com\n"
+            "To: recipient@example.com\n"
+            "Subject: HTML fallback\n"
+            "Message-ID: <html-fallback@example.com>\n"
+            "Date: Mon, 01 Jan 2024 00:00:00 +0000\n"
+            "MIME-Version: 1.0\n"
+            "Content-Type: multipart/alternative; boundary=boundary123\n"
+            "\n"
+            "--boundary123\n"
+            "Content-Type: text/plain; charset=utf-8\n"
+            "\n"
+            "Plain fallback text.\n"
+            "--boundary123\n"
+            "Content-Type: text/html; charset=utf-8\n"
+            "\n"
+            "<html><body><img src=\"cid:image001\"></body></html>\n"
+            "--boundary123--\n"
+        )
+
+        records = parse_email_file(self.eml_path)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["body_text"], "Plain fallback text.")
+
+
 class TestThreadSafety(unittest.TestCase):
     """Test thread-safe operations in parallel ingestion."""
     def test_lock_protects_shared_state(self):

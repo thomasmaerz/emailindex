@@ -1000,7 +1000,13 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
         
         parent_record['body_markdown'] = body_markdown.strip()
         if html_body:
-            parent_record['body_text'] = Converter.extract_text_from_html(html_body).strip()
+            html_text = Converter.extract_text_from_html(html_body).strip()
+            if html_text:
+                parent_record['body_text'] = html_text
+            elif plain_body:
+                parent_record['body_text'] = plain_body.strip()
+            else:
+                parent_record['body_text'] = body_markdown.strip()
         elif plain_body:
             parent_record['body_text'] = plain_body.strip()
         else:
