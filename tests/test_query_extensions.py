@@ -30,6 +30,33 @@ def create_fake_db_connection():
     fake_conn = FakeConnection(fake_cursor)
     return fake_conn, fake_cursor
 
+
+def create_fake_search_connection(results, embedding=b"seed-embedding"):
+    class FakeCursor:
+        def __init__(self):
+            self.calls = []
+            self._results = results
+
+        def execute(self, sql, params):
+            self.calls.append((sql, params))
+
+        def fetchone(self):
+            return {"embedding": embedding}
+
+        def fetchall(self):
+            return self._results
+
+    class FakeConnection:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def cursor(self):
+            return self._cursor
+
+    fake_cursor = FakeCursor()
+    fake_conn = FakeConnection(fake_cursor)
+    return fake_conn, fake_cursor
+
 def create_test_db():
     fd, path = tempfile.mkstemp(suffix='.db')
     os.close(fd)
@@ -319,6 +346,47 @@ def test_initialize_embedding_model_async_retries_after_previous_failure():
 
         thread_mock.assert_called_once()
 
+
+def test_search_emails_similarity_order():
+    from mcp_server.database import search_emails
+
+    fake_results = [
+        {
+            "id": "2",
+            "thread_id": "thread-2",
+            "subject": "Less similar",
+            "timestamp": "2024-01-02T00:00:00Z",
+            "from_address": "b@example.com",
+            "from_name": "B",
+            "has_attachments": 0,
+            "folder": "INBOX",
+            "snippet": "snippet-b",
+            "score": 0.9,
+        },
+        {
+            "id": "1",
+            "thread_id": "thread-1",
+            "subject": "More similar",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "from_address": "a@example.com",
+            "from_name": "A",
+            "has_attachments": 0,
+            "folder": "INBOX",
+            "snippet": "snippet-a",
+            "score": 0.1,
+        },
+    ]
+    fake_conn, fake_cursor = create_fake_search_connection(fake_results)
+
+    with patch("mcp_server.database.get_connection", return_value=fake_conn), \
+         patch("mcp_server.database.close_connection"):
+        similar = search_emails(similar_to_email_id="seed-id", limit=5)
+
+    assert len(fake_cursor.calls) == 2, f"Expected embedding lookup and search query, got {fake_cursor.calls}"
+    sql, _ = fake_cursor.calls[1]
+    assert "ORDER BY score ASC" in sql, f"Expected vector similarity ordering by ascending distance, got {sql}"
+    assert [result.id for result in similar] == ["2", "1"], f"Expected fake result order to be preserved, got {similar}"
+
 if __name__ == "__main__":
     test_count_only_returns_count()
     test_sort_by_timestamp_asc()
@@ -336,4 +404,5 @@ if __name__ == "__main__":
     test_limit_is_clamped_to_documented_maximum()
     test_get_embedding_model_returns_initializing_error_without_blocking()
     test_initialize_embedding_model_async_retries_after_previous_failure()
+    test_search_emails_similarity_order()
     print("\n✅ All query extension tests passed!")
