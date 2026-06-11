@@ -439,6 +439,7 @@ def query_email_database(
     snippet_length: int = 32,
     cursor: Optional[str] = None,
 ) -> dict:
+    limit = max(1, min(limit, 50))
     conn = get_connection()
     cursor_conn = conn.cursor()
 
@@ -505,7 +506,7 @@ def query_email_database(
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
     from_clause = "FROM emails e"
-    if exact_keywords:
+    if fts_query:
         from_clause += " JOIN emails_fts ON e.rowid = emails_fts.rowid"
     query_params = ([fts_query] if fts_query else []) + list(params)
 
@@ -517,13 +518,13 @@ def query_email_database(
         return {"count": count}
 
     # Determine sort order
-    use_fts_join = bool(exact_keywords)
+    use_fts_join = bool(fts_query)
     
     # Determine if we need snippet (check before semantic query path)
-    use_snippet = snippet_only and (exact_keywords or semantic_query)
+    use_snippet = snippet_only and (bool(fts_query) or semantic_query)
     
     # Handle semantic query (vector search)
-    if semantic_query and not exact_keywords:
+    if semantic_query and not fts_query:
         try:
             query_embedding = _encode_text_to_embedding(semantic_query)
         except Exception as e:
@@ -541,10 +542,9 @@ def query_email_database(
             ORDER BY relevance_score ASC
             LIMIT ?
         """
-        params.insert(0, query_embedding)
-        params.append(limit)
+        semantic_params = [query_embedding, limit]
         
-        cursor_conn.execute(sql, params)
+        cursor_conn.execute(sql, semantic_params)
         results = cursor_conn.fetchall()
         
         output = []
@@ -589,20 +589,20 @@ def query_email_database(
         order_clause = f"ORDER BY e.timestamp {order}"
     elif sort_by == "relevance":
         order = "ASC" if sort_order == "asc" else "DESC"
-        if exact_keywords:
+        if fts_query:
             order_clause = f"ORDER BY rank {order}"
         else:
             order_clause = f"ORDER BY e.timestamp {order}"
             use_fts_join = False
     else:
-        if exact_keywords:
+        if fts_query:
             order_clause = "ORDER BY rank DESC"
         else:
             order_clause = "ORDER BY e.timestamp DESC"
             use_fts_join = False
 
     # Determine if we need snippet
-    use_snippet = snippet_only and (exact_keywords or semantic_query)
+    use_snippet = snippet_only and (bool(fts_query) or semantic_query)
 
     # Build SELECT columns
     if use_snippet:
@@ -663,7 +663,7 @@ def query_email_database(
 
     # Compute normalized relevance scores for FTS5
     rank_values = []
-    if exact_keywords:
+    if fts_query:
         raw_ranks = []
         for row in results:
             try:
@@ -881,8 +881,8 @@ def get_mention_timeline(
     conn = get_connection()
     cursor = conn.cursor()
 
-    from_clause = "FROM emails e JOIN emails_fts fts ON e.rowid = fts.rowid"
-    where_clauses = ["fts MATCH ?"]
+    from_clause = "FROM emails e JOIN emails_fts ON e.rowid = emails_fts.rowid"
+    where_clauses = ["emails_fts MATCH ?"]
     params: list[object] = [keyword]
 
     if date_from:

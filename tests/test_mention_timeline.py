@@ -73,7 +73,21 @@ def test_timeline_with_filters():
     finally:
         os.unlink(path)
 
+
+def test_timeline_uses_fts_table_name_in_match_clause():
+    path = create_test_db()
+    try:
+        Config.DB_PATH = Path(path)
+        result = get_mention_timeline(keyword="John Doe", granularity="month")
+        assert result["total_matches"] > 0, f"Expected timeline matches, got {result}"
+        assert any(period.startswith("2015-") for period in result["timeline"].keys()), (
+            f"Expected month-granularity timeline periods, got {result['timeline']}"
+        )
+    finally:
+        os.unlink(path)
+
 if __name__ == "__main__":
     test_timeline_yearly()
     test_timeline_with_filters()
+    test_timeline_uses_fts_table_name_in_match_clause()
     print("\n✅ All mention timeline tests passed!")

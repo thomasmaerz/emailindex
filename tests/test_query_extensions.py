@@ -140,6 +140,63 @@ def test_semantic_query_returns_timeout_error_without_loading_model():
     assert "Failed to encode semantic query" in result["error"], f"Expected semantic error, got {result}"
 
 
+def test_semantic_query_with_filters_does_not_reuse_fts_params():
+    class FakeCursor:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, params):
+            self.calls.append((sql, params))
+
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def cursor(self):
+            return self._cursor
+
+    fake_cursor = FakeCursor()
+    fake_conn = FakeConnection(fake_cursor)
+
+    with patch("mcp_server.database._encode_text_to_embedding", return_value=b"fake-embedding"), \
+         patch("mcp_server.database.get_connection", return_value=fake_conn), \
+         patch("mcp_server.database.close_connection"):
+        result = query_email_database(semantic_query="project update", category_filter="finance")
+
+    assert result["results"] == [], f"Expected empty semantic result set from fake cursor, got {result}"
+    assert len(fake_cursor.calls) == 1, f"Expected exactly one semantic query execution, got {fake_cursor.calls}"
+    _, params = fake_cursor.calls[0]
+    assert params == [b"fake-embedding", 10], f"Expected semantic params to exclude filter placeholders, got {params}"
+
+
+def test_whitespace_keywords_do_not_enable_fts_join():
+    path = create_test_db()
+    original_db = Config.DB_PATH
+    try:
+        Config.DB_PATH = Path(path)
+        result = query_email_database(exact_keywords="   ", sort_by="timestamp", limit=2)
+        assert len(result["results"]) == 2, f"Expected normal non-FTS query results, got {result}"
+    finally:
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
+def test_limit_is_clamped_to_documented_maximum():
+    path = create_test_db()
+    original_db = Config.DB_PATH
+    try:
+        Config.DB_PATH = Path(path)
+        result = query_email_database(limit=999)
+        assert len(result["results"]) == 4, f"Expected existing rows only after clamp, got {len(result['results'])}"
+        assert result["has_more"] is False, f"Expected has_more false for clamped limit, got {result}"
+    finally:
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
 def test_get_embedding_model_returns_initializing_error_without_blocking():
     with patch("mcp_server.database.threading.Thread") as thread_mock, \
          patch("mcp_server.database._embedding_model", None), \
@@ -161,5 +218,8 @@ if __name__ == "__main__":
     test_tag_filters_bind_all_placeholders()
     test_fts_snippet_query_uses_join_alias()
     test_semantic_query_returns_timeout_error_without_loading_model()
+    test_semantic_query_with_filters_does_not_reuse_fts_params()
+    test_whitespace_keywords_do_not_enable_fts_join()
+    test_limit_is_clamped_to_documented_maximum()
     test_get_embedding_model_returns_initializing_error_without_blocking()
     print("\n✅ All query extension tests passed!")
