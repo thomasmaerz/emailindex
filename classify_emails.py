@@ -18,6 +18,8 @@ DB_PATH = BASE_DIR / "db" / "emails.db"
 LOG_DIR = BASE_DIR / "ingestion" / "logs"
 CHECKPOINT_PATH = BASE_DIR / "ingestion" / "resume_classify.json"
 
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 BATCH_SIZE = int(os.environ.get("EMAILINDEX_BATCH_SIZE", "100"))
 
 logging.basicConfig(
