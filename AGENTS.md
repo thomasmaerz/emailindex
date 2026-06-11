@@ -31,6 +31,13 @@ The Email Intelligence System parses personal email archives into a queryable SQ
 - **Attachment management** with SHA-256 deduplication
 - **Parallel resumable ingestion** for large archives (12+ years of email) using ThreadPoolExecutor with configurable concurrency
 
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HF_HUB_OFFLINE` | `1` | Set to `1` (default) to use cached model only and avoid HuggingFace Hub network checks. Set to `0` to allow model update checks (requires internet + optional `HF_TOKEN`). |
+| `HF_TOKEN` | — | Optional HuggingFace token for authenticated Hub access when `HF_HUB_OFFLINE=0`. |
+
 ---
 
 ## 2. Directory Structure
