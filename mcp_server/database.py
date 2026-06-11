@@ -189,9 +189,10 @@ def search_emails(
     
     # Vector similarity search using sqlite-vec
     # NOTE: This query performs a brute-force full-table scan over vectorized emails.
-    # The current schema and queries do not create or use ANN indexes for this path.
+    # sqlite-vec v0.1.8+ supports ANN indexes, but the current schema and queries
+    # in this codebase do not create or use them for this path.
     # Latency scales linearly: ~81K emails ≈ 3-5s, ~500K emails ≈ 30s.
-    # Track upstream: https://github.com/asg017/sqlite-vec for index support.
+    # See https://github.com/asg017/sqlite-vec for index options and future adoption.
     if similar_to_email_id:
         cursor.execute("SELECT embedding FROM emails WHERE id = ?", (similar_to_email_id,))
         row = cursor.fetchone()
@@ -542,9 +543,10 @@ def query_email_database(
                    e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
                    COALESCE(e.body_text, e.body_markdown) as body_text,
                    -- NOTE: This query performs a brute-force full-table scan over email_vectors.
-                   -- The current schema and queries do not create or use ANN indexes for this path.
+                   -- sqlite-vec v0.1.8+ supports ANN indexes, but the current schema and queries
+                   -- in this codebase do not create or use them for this path.
                    -- Latency scales linearly: ~81K emails ≈ 3-5s, ~500K emails ≈ 30s.
-                   -- Track upstream: https://github.com/asg017/sqlite-vec for index support.
+                   -- See https://github.com/asg017/sqlite-vec for index options and future adoption.
                    vec_distance_cosine(ev.embedding, ?) as relevance_score
             FROM emails e
             JOIN email_vectors ev ON e.id = ev.email_id
