@@ -290,9 +290,18 @@ def get_email(email_id: str) -> Optional[EmailRecord]:
 def get_conversation(thread_id: str) -> Optional[ConversationThread]:
     conn = get_connection()
     cursor = conn.cursor()
+
+    conversation_columns = """
+        id, message_id, thread_id, subject_thread_key, timestamp,
+        from_address, from_name, to_addresses, cc_addresses, subject,
+        body_markdown, body_plain, body_text, x_mailer, has_attachments,
+        attachments, folder, source, parent_id, content_hash, sender,
+        recipients, category_tags, project_tags, is_outbound
+    """
     
-    cursor.execute("""
-        SELECT * FROM emails 
+    cursor.execute(f"""
+        SELECT {conversation_columns}
+        FROM emails
         WHERE thread_id = ?
         ORDER BY timestamp ASC
     """, (thread_id,))
@@ -302,8 +311,9 @@ def get_conversation(thread_id: str) -> Optional[ConversationThread]:
     if not rows:
         if thread_id.startswith('thread-'):
             normalized_subject = thread_id.replace('thread-', '')
-            cursor.execute("""
-                SELECT * FROM emails 
+            cursor.execute(f"""
+                SELECT {conversation_columns}
+                FROM emails 
                 WHERE subject_thread_key = ?
                 ORDER BY timestamp ASC
             """, (normalized_subject,))
