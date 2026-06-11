@@ -484,7 +484,7 @@ def query_email_database(
         where_clauses.append("e.timestamp <= ?")
         params.append(date_to)
     if from_address:
-        where_clauses.append("e.sender = ?")
+        where_clauses.append("e.from_address = ?")
         params.append(from_address)
     if from_name:
         where_clauses.append("e.from_name LIKE ?")
@@ -893,8 +893,8 @@ def get_mention_timeline(
     conn = get_connection()
     cursor = conn.cursor()
 
-    from_clause = "FROM emails e JOIN emails_fts ON e.rowid = emails_fts.rowid"
-    where_clauses = ["emails_fts MATCH ?"]
+    from_clause = "FROM emails e"
+    where_clauses = ["e.rowid IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)"]
     params: list[object] = [keyword]
 
     if date_from:
@@ -904,7 +904,7 @@ def get_mention_timeline(
         where_clauses.append("e.timestamp <= ?")
         params.append(date_to)
     if from_address:
-        where_clauses.append("e.sender = ?")
+        where_clauses.append("e.from_address = ?")
         params.append(from_address)
     if is_outbound is not None:
         where_clauses.append("e.is_outbound = ?")
@@ -970,8 +970,8 @@ def get_contact_profile(
         where_clauses.append("(e.from_name LIKE ? OR e.sender LIKE ? OR e.recipients LIKE ? OR e.to_addresses LIKE ? OR e.cc_addresses LIKE ?)")
         params.extend([f"%{name}%", f"%{name}%", f"%{name}%", f"%{name}%", f"%{name}%"])
     if email_address:
-        where_clauses.append("(e.sender LIKE ? OR e.recipients LIKE ?)")
-        params.extend([f"%{email_address}%", f"%{email_address}%"])
+        where_clauses.append("(e.from_address = ? OR e.recipients LIKE ?)")
+        params.extend([email_address, f"%{email_address}%"])
 
     if not where_clauses:
         close_connection()
