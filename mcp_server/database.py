@@ -87,14 +87,48 @@ def _decode_cursor(cursor: str) -> tuple:
 _thread_local = threading.local()
 
 _embedding_model = None
+_embedding_model_loading = False
+_embedding_model_load_error = None
+_embedding_model_lock = threading.Lock()
+
+
+def _load_embedding_model() -> None:
+    global _embedding_model, _embedding_model_loading, _embedding_model_load_error
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer(Config.EMBEDDING_MODEL)
+        with _embedding_model_lock:
+            _embedding_model = model
+            _embedding_model_load_error = None
+    except Exception as exc:
+        with _embedding_model_lock:
+            _embedding_model_load_error = exc
+    finally:
+        with _embedding_model_lock:
+            _embedding_model_loading = False
+
+
+def initialize_embedding_model_async() -> None:
+    global _embedding_model_loading
+    with _embedding_model_lock:
+        if _embedding_model is not None or _embedding_model_loading:
+            return
+        _embedding_model_loading = True
+
+    thread = threading.Thread(target=_load_embedding_model, name="embedding-model-loader", daemon=True)
+    thread.start()
 
 
 def _get_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embedding_model = SentenceTransformer(Config.EMBEDDING_MODEL)
-    return _embedding_model
+    if _embedding_model is not None:
+        return _embedding_model
+
+    initialize_embedding_model_async()
+
+    if _embedding_model_load_error is not None:
+        raise RuntimeError(f"Embedding model failed to initialize: {_embedding_model_load_error}")
+
+    raise RuntimeError("Embedding model is still initializing. Retry semantic query shortly.")
 
 
 def _encode_text_to_embedding(text: str) -> bytes:
@@ -406,15 +440,19 @@ def query_email_database(
     conn = get_connection()
     cursor_conn = conn.cursor()
 
+    def _build_tag_filter_clause(column_name: str, tags: list[str]) -> str:
+        return " OR ".join([f"{column_name} LIKE ?" for _ in tags])
+
     where_clauses = []
     params = []
+    fts_query = None
 
     # Build WHERE clauses
     if exact_keywords:
         safe_query = exact_keywords.strip()
         if safe_query:
             where_clauses.append("emails_fts MATCH ?")
-            params.append(safe_query)
+            fts_query = safe_query
 
     if category_filter or project_filter:
         tags = []
@@ -423,10 +461,11 @@ def query_email_database(
         if project_filter:
             tags.extend([p.strip() for p in project_filter.split(",")])
         if tags:
-            tag_conditions = " OR ".join(["category_tags LIKE ?" for _ in tags])
-            tag_conditions += " OR " + " OR ".join(["project_tags LIKE ?" for _ in tags])
+            tag_conditions = _build_tag_filter_clause("e.category_tags", tags)
+            tag_conditions += " OR " + _build_tag_filter_clause("e.project_tags", tags)
             where_clauses.append(f"({tag_conditions})")
-            params.extend([f"%{t}%" for t in tags])
+            tag_params = [f"%{t}%" for t in tags]
+            params.extend(tag_params * 2)
 
     if date_from:
         where_clauses.append("e.timestamp >= ?")
@@ -463,10 +502,14 @@ def query_email_database(
             params.extend([last_ts, last_ts, last_id])
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+    from_clause = "FROM emails e"
+    if exact_keywords:
+        from_clause += " JOIN emails_fts ON e.rowid = emails_fts.rowid"
+    query_params = ([fts_query] if fts_query else []) + list(params)
 
     # Handle count_only
     if count_only:
-        cursor_conn.execute(f"SELECT COUNT(*) as cnt FROM emails e WHERE {where_sql}", params)
+        cursor_conn.execute(f"SELECT COUNT(*) as cnt {from_clause} WHERE {where_sql}", query_params)
         count = cursor_conn.fetchone()["cnt"]
         close_connection()
         return {"count": count}
@@ -542,17 +585,16 @@ def query_email_database(
     if sort_by == "timestamp":
         order = "ASC" if sort_order == "asc" else "DESC"
         order_clause = f"ORDER BY e.timestamp {order}"
-        use_fts_join = False
     elif sort_by == "relevance":
         order = "ASC" if sort_order == "asc" else "DESC"
         if exact_keywords:
-            order_clause = f"ORDER BY fts.rank {order}"
+            order_clause = f"ORDER BY rank {order}"
         else:
             order_clause = f"ORDER BY e.timestamp {order}"
             use_fts_join = False
     else:
         if exact_keywords:
-            order_clause = "ORDER BY fts.rank DESC"
+            order_clause = "ORDER BY rank DESC"
         else:
             order_clause = "ORDER BY e.timestamp DESC"
             use_fts_join = False
@@ -563,15 +605,14 @@ def query_email_database(
     # Build SELECT columns
     if use_snippet:
         sql = f"""
-            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
-                   e.from_name, e.has_attachments, e.folder,
-                   snippet(emails_fts, 1, '<mark>', '</mark>', '...', {snippet_length}) as snippet,
-                   bm25(emails_fts) as rank
-            FROM emails e
-            JOIN emails_fts fts ON e.rowid = fts.rowid
-            WHERE {where_sql}
-            {order_clause}
-            LIMIT ?
+                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                       e.from_name, e.has_attachments, e.folder,
+                       snippet(emails_fts, 1, '<mark>', '</mark>', '...', {snippet_length}) as snippet,
+                       bm25(emails_fts) as rank
+                {from_clause}
+                WHERE {where_sql}
+                {order_clause}
+                LIMIT ?
         """
         use_fts_join = True
     elif fields is not None:
@@ -579,8 +620,7 @@ def query_email_database(
         if use_fts_join:
             sql = f"""
                 SELECT {columns}, bm25(emails_fts) as rank
-                FROM emails e
-                JOIN emails_fts fts ON e.rowid = fts.rowid
+                {from_clause}
                 WHERE {where_sql}
                 {order_clause}
                 LIMIT ?
@@ -599,8 +639,7 @@ def query_email_database(
                 SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
                        e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
                        COALESCE(e.body_text, e.body_markdown) as body_text, bm25(emails_fts) as rank
-                FROM emails e
-                JOIN emails_fts fts ON e.rowid = fts.rowid
+                {from_clause}
                 WHERE {where_sql}
                 {order_clause}
                 LIMIT ?
@@ -615,9 +654,9 @@ def query_email_database(
                 {order_clause}
                 LIMIT ?
             """
-    params.append(limit)
+    final_params = query_params + [limit]
 
-    cursor_conn.execute(sql, params)
+    cursor_conn.execute(sql, final_params)
     results = cursor_conn.fetchall()
 
     # Compute normalized relevance scores for FTS5
@@ -840,8 +879,9 @@ def get_mention_timeline(
     conn = get_connection()
     cursor = conn.cursor()
 
-    where_clauses = ["e.rowid IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)"]
-    params = [keyword]
+    from_clause = "FROM emails e JOIN emails_fts fts ON e.rowid = fts.rowid"
+    where_clauses = ["fts MATCH ?"]
+    params: list[object] = [keyword]
 
     if date_from:
         where_clauses.append("e.timestamp >= ?")
@@ -859,12 +899,12 @@ def get_mention_timeline(
     where_clauses.append("(e.source IS NULL OR e.source != 'quoted_reply')")
     where_sql = " AND ".join(where_clauses)
 
-    cursor.execute(f"SELECT COUNT(*) as cnt FROM emails e WHERE {where_sql}", params)
+    cursor.execute(f"SELECT COUNT(*) as cnt {from_clause} WHERE {where_sql}", params)
     total = cursor.fetchone()["cnt"]
 
     cursor.execute(f"""
         SELECT MIN(e.timestamp) as first, MAX(e.timestamp) as last
-        FROM emails e WHERE {where_sql}
+        {from_clause} WHERE {where_sql}
     """, params)
     bounds = cursor.fetchone()
 

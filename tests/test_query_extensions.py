@@ -1,9 +1,10 @@
 import sys, tempfile, sqlite3, os
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mcp_server.database import query_email_database
+from mcp_server.database import query_email_database, _get_embedding_model
 from mcp_server.config import Config
 
 def create_test_db():
@@ -106,10 +107,57 @@ def test_relevance_score_in_fts_results():
     finally:
         os.unlink(path)
 
+
+def test_tag_filters_bind_all_placeholders():
+    path = create_test_db()
+    original_db = Config.DB_PATH
+    try:
+        Config.DB_PATH = Path(path)
+        result = query_email_database(category_filter="finance,work", project_filter="alpha")
+        assert "results" in result, f"Expected results key, got {result.keys()}"
+    finally:
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
+def test_fts_snippet_query_uses_join_alias():
+    path = create_test_db()
+    original_db = Config.DB_PATH
+    try:
+        Config.DB_PATH = Path(path)
+        result = query_email_database(exact_keywords="John Doe", snippet_only=True, limit=2)
+        assert len(result["results"]) >= 1, f"Expected snippet results, got {result}"
+        assert "snippet" in result["results"][0], f"Expected snippet field, got {result['results'][0].keys()}"
+    finally:
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
+def test_semantic_query_returns_timeout_error_without_loading_model():
+    with patch("mcp_server.database._encode_text_to_embedding", side_effect=TimeoutError("model init timed out")):
+        result = query_email_database(semantic_query="project update")
+    assert result["results"] == [], f"Expected empty results on semantic timeout, got {result}"
+    assert "Failed to encode semantic query" in result["error"], f"Expected semantic error, got {result}"
+
+
+def test_get_embedding_model_returns_initializing_error_without_blocking():
+    with patch("mcp_server.database.initialize_embedding_model_async") as init_mock, \
+         patch("mcp_server.database._embedding_model", None), \
+         patch("mcp_server.database._embedding_model_load_error", None):
+        try:
+            _get_embedding_model()
+            assert False, "Expected initialization-in-progress error"
+        except RuntimeError as exc:
+            assert "still initializing" in str(exc), f"Unexpected error: {exc}"
+        init_mock.assert_called_once()
+
 if __name__ == "__main__":
     test_count_only_returns_count()
     test_sort_by_timestamp_asc()
     test_sort_by_timestamp_desc()
     test_from_name_filter()
     test_relevance_score_in_fts_results()
+    test_tag_filters_bind_all_placeholders()
+    test_fts_snippet_query_uses_join_alias()
+    test_semantic_query_returns_timeout_error_without_loading_model()
     print("\n✅ All query extension tests passed!")
