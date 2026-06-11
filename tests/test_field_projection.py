@@ -36,7 +36,7 @@ def create_test_db():
         "2024-01-15T10:00:00Z", "alice@example.com", "Alice Smith",
         '["bob@example.com"]', '["carol@example.com"]', "Project Update",
         "# Full body\n\nThis is a long body with lots of text about the project update.",
-        "Cleaned body text", "INBOX", "alice@example.com", '["bob@example.com", "carol@example.com"]',
+        "Cleaned body text", "INBOX", "legacy-sender@example.com", '["bob@example.com", "carol@example.com"]',
         '["work"]', '["ProjectAlpha"]', 0, "project update"
     ))
     cursor.execute("INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)", ("Project Update", "Full body project update"))
@@ -70,6 +70,17 @@ def test_custom_fields_projection():
         r = result["results"][0]
         assert set(r.keys()) == {"id", "timestamp", "from_address", "subject"}
         print("✓ test_custom_fields_projection passed")
+    finally:
+        os.unlink(path)
+
+def test_from_address_projection_uses_from_address_column():
+    """from_address projections should read the from_address column, not sender."""
+    path = create_test_db()
+    try:
+        Config.DB_PATH = Path(path)
+        result = query_email_database(fields=["id", "from_address"])
+        r = result["results"][0]
+        assert r["from_address"] == "alice@example.com"
     finally:
         os.unlink(path)
 
@@ -117,6 +128,7 @@ def test_recipients_in_default():
 if __name__ == "__main__":
     test_default_fields_minimal()
     test_custom_fields_projection()
+    test_from_address_projection_uses_from_address_column()
     test_snippet_only_with_fts()
     test_excluded_fields_never_returned()
     test_recipients_in_default()

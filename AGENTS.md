@@ -43,6 +43,7 @@ The Email Intelligence System parses personal email archives into a queryable SQ
 | Limitation | Impact | Tracking |
 |------------|--------|---------|
 | Vector search (sqlite-vec) uses brute-force scan — no ANN index | ~3-5s per semantic query on 81K emails; degrades linearly | Upstream: https://github.com/asg017/sqlite-vec |
+| `recipients LIKE '%addr%'` uses full table scan | No B-tree index can accelerate leading-wildcard LIKE on JSON array columns. Junction table migration would fix this but is out of scope. | — |
 
 ---
 

@@ -43,7 +43,7 @@ def _build_select_columns(fields):
         "thread_id": "e.thread_id",
         "subject_thread_key": "e.subject_thread_key",
         "timestamp": "e.timestamp",
-        "from_address": "e.sender as from_address",
+        "from_address": "e.from_address as from_address",
         "from_name": "e.from_name",
         "to_addresses": "e.to_addresses",
         "cc_addresses": "e.cc_addresses",
@@ -484,7 +484,7 @@ def query_email_database(
         where_clauses.append("e.timestamp <= ?")
         params.append(date_to)
     if from_address:
-        where_clauses.append("e.sender = ?")
+        where_clauses.append("e.from_address = ?")
         params.append(from_address)
     if from_name:
         where_clauses.append("e.from_name LIKE ?")
@@ -539,7 +539,7 @@ def query_email_database(
             return {"error": f"Failed to encode semantic query: {e}", "results": []}
 
         sql = f"""
-            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                    e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
                    COALESCE(e.body_text, e.body_markdown) as body_text,
                    -- NOTE: This query performs a brute-force full-table scan over email_vectors.
@@ -619,7 +619,7 @@ def query_email_database(
     # Build SELECT columns
     if use_snippet:
         sql = f"""
-                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                        e.from_name, e.has_attachments, e.folder,
                        snippet(emails_fts, 1, '<mark>', '</mark>', '...', {snippet_length}) as snippet,
                        bm25(emails_fts) as rank
@@ -650,7 +650,7 @@ def query_email_database(
     else:
         if use_fts_join:
             sql = f"""
-                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                        e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
                        COALESCE(e.body_text, e.body_markdown) as body_text, bm25(emails_fts) as rank
                 {from_clause}
@@ -660,7 +660,7 @@ def query_email_database(
             """
         else:
             sql = f"""
-                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                        e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
                        COALESCE(e.body_text, e.body_markdown) as body_text
                 FROM emails e
@@ -748,7 +748,7 @@ def query_email_database(
 
     if include_full_thread and thread_ids:
         cursor_conn.execute("""
-            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                    e.body_text
             FROM emails e
             WHERE e.thread_id IN ({})
@@ -820,7 +820,7 @@ def get_project_context(project_name: str, limit: int = 10) -> Optional[dict]:
     }
     
     cursor.execute("""
-        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                e.category_tags, e.project_tags, e.has_attachments, e.folder,
                COALESCE(e.body_text, e.body_markdown) as body_text
         FROM emails e
@@ -893,8 +893,8 @@ def get_mention_timeline(
     conn = get_connection()
     cursor = conn.cursor()
 
-    from_clause = "FROM emails e JOIN emails_fts ON e.rowid = emails_fts.rowid"
-    where_clauses = ["emails_fts MATCH ?"]
+    from_clause = "FROM emails e"
+    where_clauses = ["e.rowid IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)"]
     params: list[object] = [keyword]
 
     if date_from:
@@ -904,7 +904,7 @@ def get_mention_timeline(
         where_clauses.append("e.timestamp <= ?")
         params.append(date_to)
     if from_address:
-        where_clauses.append("e.sender = ?")
+        where_clauses.append("e.from_address = ?")
         params.append(from_address)
     if is_outbound is not None:
         where_clauses.append("e.is_outbound = ?")
@@ -970,8 +970,8 @@ def get_contact_profile(
         where_clauses.append("(e.from_name LIKE ? OR e.sender LIKE ? OR e.recipients LIKE ? OR e.to_addresses LIKE ? OR e.cc_addresses LIKE ?)")
         params.extend([f"%{name}%", f"%{name}%", f"%{name}%", f"%{name}%", f"%{name}%"])
     if email_address:
-        where_clauses.append("(e.sender LIKE ? OR e.recipients LIKE ?)")
-        params.extend([f"%{email_address}%", f"%{email_address}%"])
+        where_clauses.append("(e.from_address = ? OR e.recipients LIKE ?)")
+        params.extend([email_address, f"%{email_address}%"])
 
     if not where_clauses:
         close_connection()
@@ -1013,7 +1013,7 @@ def get_contact_profile(
             timeline[row["year"]] = row["count"]
 
     cursor.execute(f"""
-        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                e.from_name, e.has_attachments, e.folder,
                COALESCE(e.body_text, e.body_markdown) as body_text, e.is_outbound
         FROM emails e WHERE {where_sql} ORDER BY e.timestamp DESC LIMIT ?
@@ -1055,7 +1055,7 @@ def get_thread_arc(
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+        SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                e.from_name, e.is_outbound,
                COALESCE(e.body_text, e.body_markdown) as body_text
         FROM emails e
@@ -1070,7 +1070,7 @@ def get_thread_arc(
     if not rows and thread_id.startswith("thread-"):
         subject_key = thread_id.replace("thread-", "")
         cursor.execute("""
-            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.sender as from_address,
+            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                    e.from_name, e.is_outbound,
                    COALESCE(e.body_text, e.body_markdown) as body_text
             FROM emails e
@@ -1154,7 +1154,7 @@ def list_threads(
     threads = []
     for row in rows:
         cursor.execute("""
-            SELECT e.id, e.subject, e.timestamp, e.sender as from_address, e.from_name
+            SELECT e.id, e.subject, e.timestamp, e.from_address as from_address, e.from_name
             FROM emails e
             WHERE e.thread_id = ?
               AND (e.source IS NULL OR e.source != 'quoted_reply')

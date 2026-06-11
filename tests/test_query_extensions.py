@@ -4,7 +4,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mcp_server.database import query_email_database, _get_embedding_model, initialize_embedding_model_async
+from mcp_server.database import (
+    query_email_database,
+    get_mention_timeline,
+    _get_embedding_model,
+    initialize_embedding_model_async,
+)
 from mcp_server.config import Config
 
 
@@ -77,6 +82,7 @@ def create_test_db():
         )
     """)
     cursor.execute("CREATE VIRTUAL TABLE emails_fts USING fts5(subject, body_markdown, content=emails, content_rowid=rowid)")
+    cursor.execute("CREATE INDEX idx_emails_from_address ON emails(from_address)")
 
     emails = [
         ("001", "2013-01-01T10:00:00Z", "john@old.com", "John Doe", "john@old.com", '["me@example.com"]', "Old mention of John", "John Doe discussed the project.", "[]", "[]"),
@@ -108,6 +114,58 @@ def create_test_db():
     conn.commit()
     conn.close()
     return path
+
+
+def capture_sql_calls(path, callback):
+    class LoggingCursor:
+        def __init__(self, inner_cursor, calls):
+            self._inner_cursor = inner_cursor
+            self._calls = calls
+
+        def execute(self, sql, params=()):
+            normalized_params = tuple(params) if params is not None else ()
+            self._calls.append((sql, normalized_params))
+            return self._inner_cursor.execute(sql, params)
+
+        def fetchone(self):
+            return self._inner_cursor.fetchone()
+
+        def fetchall(self):
+            return self._inner_cursor.fetchall()
+
+        def __getattr__(self, name):
+            return getattr(self._inner_cursor, name)
+
+    class LoggingConnection:
+        def __init__(self, inner_conn):
+            self._inner_conn = inner_conn
+            self.calls = []
+
+        def cursor(self):
+            return LoggingCursor(self._inner_conn.cursor(), self.calls)
+
+        def __getattr__(self, name):
+            return getattr(self._inner_conn, name)
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    logging_conn = LoggingConnection(conn)
+    try:
+        with patch("mcp_server.database.get_connection", return_value=logging_conn), \
+             patch("mcp_server.database.close_connection"):
+            callback()
+    finally:
+        conn.close()
+
+    return logging_conn.calls
+
+
+def explain_query_plan(path, sql, params):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
+    finally:
+        conn.close()
 
 def test_count_only_returns_count():
     path = create_test_db()
@@ -152,6 +210,52 @@ def test_from_name_filter():
         for r in result["results"]:
             assert "John" in r["from_name"] or "Doe" in r["from_name"], f"from_name mismatch: {r['from_name']}"
         print("✓ test_from_name_filter passed")
+    finally:
+        os.unlink(path)
+
+
+def test_query_email_database_from_address_filter_uses_from_address_index():
+    path = create_test_db()
+    try:
+        sql_calls = capture_sql_calls(
+            path,
+            lambda: query_email_database(from_address="john@old.com", limit=5),
+        )
+        matching_calls = [
+            (sql, params)
+            for sql, params in sql_calls
+            if "e.from_address = ?" in sql and "FROM emails e" in sql
+        ]
+        assert matching_calls, f"Expected query_email_database to filter on e.from_address, got {sql_calls}"
+
+        plan_rows = explain_query_plan(path, matching_calls[0][0], matching_calls[0][1])
+        plan_details = " | ".join(str(row[3]) for row in plan_rows)
+        assert "idx_emails_from_address" in plan_details, (
+            f"Expected idx_emails_from_address in query plan, got {plan_details}"
+        )
+    finally:
+        os.unlink(path)
+
+
+def test_get_mention_timeline_from_address_filter_uses_from_address_index():
+    path = create_test_db()
+    try:
+        sql_calls = capture_sql_calls(
+            path,
+            lambda: get_mention_timeline(keyword="John", from_address="john@old.com", granularity="year"),
+        )
+        matching_calls = [
+            (sql, params)
+            for sql, params in sql_calls
+            if "e.from_address = ?" in sql and "FROM emails e" in sql
+        ]
+        assert matching_calls, f"Expected get_mention_timeline to filter on e.from_address, got {sql_calls}"
+
+        plan_rows = explain_query_plan(path, matching_calls[0][0], matching_calls[0][1])
+        plan_details = " | ".join(str(row[3]) for row in plan_rows)
+        assert "idx_emails_from_address" in plan_details, (
+            f"Expected idx_emails_from_address in timeline query plan, got {plan_details}"
+        )
     finally:
         os.unlink(path)
 
