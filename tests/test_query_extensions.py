@@ -7,6 +7,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from mcp_server.database import query_email_database, _get_embedding_model, initialize_embedding_model_async
 from mcp_server.config import Config
 
+
+def create_fake_db_connection():
+    class FakeCursor:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, params):
+            self.calls.append((sql, params))
+
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def cursor(self):
+            return self._cursor
+
+    fake_cursor = FakeCursor()
+    fake_conn = FakeConnection(fake_cursor)
+    return fake_conn, fake_cursor
+
 def create_test_db():
     fd, path = tempfile.mkstemp(suffix='.db')
     os.close(fd)
@@ -162,25 +185,7 @@ def test_semantic_query_returns_timeout_error_without_loading_model():
 
 
 def test_semantic_query_with_filters_applies_shared_where_clause():
-    class FakeCursor:
-        def __init__(self):
-            self.calls = []
-
-        def execute(self, sql, params):
-            self.calls.append((sql, params))
-
-        def fetchall(self):
-            return []
-
-    class FakeConnection:
-        def __init__(self, cursor):
-            self._cursor = cursor
-
-        def cursor(self):
-            return self._cursor
-
-    fake_cursor = FakeCursor()
-    fake_conn = FakeConnection(fake_cursor)
+    fake_conn, fake_cursor = create_fake_db_connection()
 
     with patch("mcp_server.database._encode_text_to_embedding", return_value=b"fake-embedding"), \
          patch("mcp_server.database.get_connection", return_value=fake_conn), \
@@ -205,25 +210,7 @@ def test_semantic_query_with_filters_applies_shared_where_clause():
 
 
 def test_semantic_query_with_date_filter_applies_shared_where_clause():
-    class FakeCursor:
-        def __init__(self):
-            self.calls = []
-
-        def execute(self, sql, params):
-            self.calls.append((sql, params))
-
-        def fetchall(self):
-            return []
-
-    class FakeConnection:
-        def __init__(self, cursor):
-            self._cursor = cursor
-
-        def cursor(self):
-            return self._cursor
-
-    fake_cursor = FakeCursor()
-    fake_conn = FakeConnection(fake_cursor)
+    fake_conn, fake_cursor = create_fake_db_connection()
 
     with patch("mcp_server.database._encode_text_to_embedding", return_value=b"fake-embedding"), \
          patch("mcp_server.database.get_connection", return_value=fake_conn), \
@@ -244,25 +231,7 @@ def test_semantic_query_with_date_filter_applies_shared_where_clause():
 
 
 def test_semantic_query_with_is_outbound_filter_applies_shared_where_clause():
-    class FakeCursor:
-        def __init__(self):
-            self.calls = []
-
-        def execute(self, sql, params):
-            self.calls.append((sql, params))
-
-        def fetchall(self):
-            return []
-
-    class FakeConnection:
-        def __init__(self, cursor):
-            self._cursor = cursor
-
-        def cursor(self):
-            return self._cursor
-
-    fake_cursor = FakeCursor()
-    fake_conn = FakeConnection(fake_cursor)
+    fake_conn, fake_cursor = create_fake_db_connection()
 
     with patch("mcp_server.database._encode_text_to_embedding", return_value=b"fake-embedding"), \
          patch("mcp_server.database.get_connection", return_value=fake_conn), \
@@ -279,6 +248,27 @@ def test_semantic_query_with_is_outbound_filter_applies_shared_where_clause():
     assert "e.is_outbound = ?" in sql, f"Expected outbound filter in semantic SQL, got {sql}"
     assert params == [b"fake-embedding", 1, 5], (
         f"Expected semantic params to include outbound filter placeholder, got {params}"
+    )
+
+
+def test_semantic_query_with_is_outbound_false_filter_applies_shared_where_clause():
+    fake_conn, fake_cursor = create_fake_db_connection()
+
+    with patch("mcp_server.database._encode_text_to_embedding", return_value=b"fake-embedding"), \
+         patch("mcp_server.database.get_connection", return_value=fake_conn), \
+         patch("mcp_server.database.close_connection"):
+        result = query_email_database(
+            semantic_query="project update",
+            is_outbound=False,
+            limit=5,
+        )
+
+    assert result["results"] == [], f"Expected empty semantic result set from fake cursor, got {result}"
+    assert len(fake_cursor.calls) == 1, f"Expected exactly one semantic query execution, got {fake_cursor.calls}"
+    sql, params = fake_cursor.calls[0]
+    assert "e.is_outbound = ?" in sql, f"Expected outbound filter in semantic SQL, got {sql}"
+    assert params == [b"fake-embedding", 0, 5], (
+        f"Expected semantic params to normalize outbound false to 0, got {params}"
     )
 
 
@@ -341,6 +331,7 @@ if __name__ == "__main__":
     test_semantic_query_with_filters_applies_shared_where_clause()
     test_semantic_query_with_date_filter_applies_shared_where_clause()
     test_semantic_query_with_is_outbound_filter_applies_shared_where_clause()
+    test_semantic_query_with_is_outbound_false_filter_applies_shared_where_clause()
     test_whitespace_keywords_do_not_enable_fts_join()
     test_limit_is_clamped_to_documented_maximum()
     test_get_embedding_model_returns_initializing_error_without_blocking()
