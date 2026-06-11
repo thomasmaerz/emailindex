@@ -205,7 +205,7 @@ def search_emails(
                     FROM emails e
                     WHERE e.id != ? AND e.embedding IS NOT NULL
                       AND (e.source IS NULL OR e.source != 'quoted_reply')
-                    ORDER BY score DESC
+                    ORDER BY score ASC
                     LIMIT ?
                 """, (row['embedding'], similar_to_email_id, limit))
                 
