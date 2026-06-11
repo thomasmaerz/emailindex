@@ -66,7 +66,6 @@ emailindex/
 ├── run-mcp-server.sh                                   # Shell wrapper script
 ├── ingest.py                                           # Main ingestion script (parallel, --concurrent-limit)
 ├── classify_emails.py                                  # Gemini batch classification
-├── salvage_quotes.py                                   # Standalone quote re-salvage tool
 ├── requirements.txt
 └── tests/
     ├── run_all_validations.py                          # Unified test runner

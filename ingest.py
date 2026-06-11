@@ -37,6 +37,8 @@ ATTACHMENTS_DIR = BASE_DIR / "attachments"
 CHECKPOINT_PATH = BASE_DIR / "ingestion" / "resume.json"
 LOG_DIR = BASE_DIR / "ingestion" / "logs"
 
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_DIMENSIONS = 384
 EMBEDDING_BATCH_SIZE = 8
@@ -600,6 +602,9 @@ def _make_salvaged_record(content: str, content_hash: str, parent_record: dict) 
     }
 
 
+# NOTE: A standalone salvage_quotes.py previously existed but was removed (issue #38).
+# It had critical bugs (missing message_id, wrong timestamp, diverged hash normalization).
+# Quote salvaging is handled here inline during ingestion.
 def salvage_quotes(plain_text: Optional[str] = None, html_text: Optional[str] = None, parent_record: Optional[dict] = None, conn: Optional[sqlite3.Connection] = None) -> list[dict]:
     """Extract quoted fragments from plain text or HTML, deduplicate (Tier 1 + Tier 2), return salvaged records."""
     # Prefer plain text if available
