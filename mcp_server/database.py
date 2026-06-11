@@ -167,8 +167,7 @@ def close_connection():
 
 def ensure_email_category_fts(cursor: sqlite3.Cursor) -> None:
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='email_category_fts'")
-    if cursor.fetchone():
-        return
+    table_exists = cursor.fetchone() is not None
 
     cursor.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS email_category_fts USING fts5(
@@ -177,28 +176,47 @@ def ensure_email_category_fts(cursor: sqlite3.Cursor) -> None:
             content='emails'
         )
     """)
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS emails_ai AFTER INSERT ON emails BEGIN
-            INSERT INTO email_category_fts(rowid, category_tags, project_tags)
-            VALUES (new.rowid, new.category_tags, new.project_tags);
-        END
-    """)
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS emails_ad AFTER DELETE ON emails BEGIN
-            INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags)
-            VALUES('delete', old.rowid, old.category_tags, old.project_tags);
-        END
-    """)
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS emails_au AFTER UPDATE ON emails BEGIN
-            INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags)
-            VALUES('delete', old.rowid, old.category_tags, old.project_tags);
-            INSERT INTO email_category_fts(rowid, category_tags, project_tags)
-            VALUES (new.rowid, new.category_tags, new.project_tags);
-        END
-    """)
-    cursor.execute("INSERT INTO email_category_fts(email_category_fts) VALUES('rebuild')")
+
+    trigger_definitions = {
+        "emails_ai": """
+            CREATE TRIGGER IF NOT EXISTS emails_ai AFTER INSERT ON emails BEGIN
+                INSERT INTO email_category_fts(rowid, category_tags, project_tags)
+                VALUES (new.rowid, new.category_tags, new.project_tags);
+            END
+        """,
+        "emails_ad": """
+            CREATE TRIGGER IF NOT EXISTS emails_ad AFTER DELETE ON emails BEGIN
+                INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags)
+                VALUES('delete', old.rowid, old.category_tags, old.project_tags);
+            END
+        """,
+        "emails_au": """
+            CREATE TRIGGER IF NOT EXISTS emails_au AFTER UPDATE ON emails BEGIN
+                INSERT INTO email_category_fts(email_category_fts, rowid, category_tags, project_tags)
+                VALUES('delete', old.rowid, old.category_tags, old.project_tags);
+                INSERT INTO email_category_fts(rowid, category_tags, project_tags)
+                VALUES (new.rowid, new.category_tags, new.project_tags);
+            END
+        """,
+    }
+
+    missing_trigger = False
+    for trigger_name, trigger_sql in trigger_definitions.items():
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name = ?",
+            (trigger_name,),
+        )
+        if cursor.fetchone() is None:
+            missing_trigger = True
+        cursor.execute(trigger_sql)
+
+    if not table_exists or missing_trigger:
+        cursor.execute("INSERT INTO email_category_fts(email_category_fts) VALUES('rebuild')")
     cursor.connection.commit()
+
+
+def _escape_fts5_phrase(term: str) -> str:
+    return term.replace("\\", "\\\\").replace('"', '""')
 
 
 def decompress_eml(compressed_bytes: bytes) -> bytes:
@@ -856,7 +874,7 @@ def get_project_context(project_name: str, limit: int = 10) -> Optional[dict]:
         "created_at": row["created_at"]
     }
     
-    fts_query = f'project_tags:"{row["name"]}"'
+    fts_query = f'project_tags:"{_escape_fts5_phrase(row["name"])}"'
 
     cursor.execute("""
         SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,

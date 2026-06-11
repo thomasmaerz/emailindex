@@ -112,7 +112,7 @@ def call_gemini(prompt: str, max_retries: int = BATCH_RETRIES) -> Optional[str]:
     return None
 
 
-def discover_projects(checkpoint: dict, reset_registry: bool = False) -> int:
+def discover_projects(checkpoint: dict, *, reset_registry: bool = False) -> int:
     logger.info("Starting project discovery phase...")
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -130,8 +130,8 @@ def discover_projects(checkpoint: dict, reset_registry: bool = False) -> int:
     """)
     rows = cursor.fetchall()
 
-    subjects = [r["subject"] for r in rows if r["body_text"] and len(r["body_text"]) > 100]
-    bodies = [r["body_text"][:500] for r in rows if r["body_text"] and len(r["body_text"]) > 100]
+    subjects = [r["subject"] for r in rows]
+    bodies = [r["body_text"][:500] for r in rows]
 
     prompt = f"""Analyze these email subjects and body snippets to identify distinct projects, topics, or categories.
 Return a JSON array of project names (max 20) with brief descriptions.
@@ -150,6 +150,7 @@ Output format:
     result = call_gemini(prompt)
     if not result:
         logger.error("Failed to discover projects")
+        conn.rollback()
         conn.close()
         return 0
 
@@ -178,6 +179,7 @@ Output format:
 
     except Exception as e:
         logger.error(f"Failed to parse project discovery result: {e}")
+        conn.rollback()
         conn.close()
         return 0
 
@@ -315,7 +317,7 @@ Output a JSON array with:
     return classified
 
 
-def run_classification(reset_registry: bool = False):
+def run_classification(*, reset_registry: bool = False):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     checkpoint = load_checkpoint()
