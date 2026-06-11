@@ -19,7 +19,8 @@ from .models import (
 from .database import (
     search_emails, get_email, get_conversation, find_recipient_emails,
     query_email_database, get_project_context, list_projects,
-    get_mention_timeline, get_contact_profile, get_thread_arc, list_threads
+    get_mention_timeline, get_contact_profile, get_thread_arc, list_threads,
+    initialize_embedding_model_async
 )
 from .config import Config
 
@@ -28,6 +29,7 @@ class MCPServer:
     def __init__(self):
         Config.ensure_directories()
         self._verify_schema()
+        initialize_embedding_model_async()
         self.tools = {
             "query_email_database": self.tool_query_email_database,
             "get_project_context": self.tool_get_project_context,

@@ -31,15 +31,16 @@ def create_test_db():
         for i in range(year - 2014):
             uid = f"550e8400-{year:04d}-{i:04d}-0000-000000000000"
             ts = f"{year}-06-15T10:00:00Z"
+            body_markdown = f"John Doe mentioned in {year} ftsonlytoken{year}{i}"
             cursor.execute("""
                 INSERT INTO emails (id, message_id, timestamp, from_address, from_name,
                     to_addresses, subject, body_markdown, body_text, folder, sender, recipients,
                     subject_thread_key)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (uid, f"<{year}-{i}@example.com>", ts, "alice@example.com", "Alice",
-                  '["me@example.com"]', f"Mention {year}-{i}", f"John Doe mentioned in {year}",
+                  '["me@example.com"]', f"Mention {year}-{i}", body_markdown,
                   f"John Doe {year}", "INBOX", "alice@example.com", '["me@example.com"]', f"mention {year}"))
-            cursor.execute("INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)", (f"Mention {year}", f"John Doe {year}"))
+            cursor.execute("INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)", (f"Mention {year}", body_markdown))
 
     conn.commit()
     conn.close()
@@ -73,7 +74,21 @@ def test_timeline_with_filters():
     finally:
         os.unlink(path)
 
+
+def test_timeline_uses_fts_table_name_in_match_clause():
+    path = create_test_db()
+    try:
+        Config.DB_PATH = Path(path)
+        result = get_mention_timeline(keyword="ftsonlytoken20150", granularity="month")
+        assert result["total_matches"] > 0, f"Expected timeline matches, got {result}"
+        assert any(period.startswith("2015-") for period in result["timeline"].keys()), (
+            f"Expected month-granularity timeline periods, got {result['timeline']}"
+        )
+    finally:
+        os.unlink(path)
+
 if __name__ == "__main__":
     test_timeline_yearly()
     test_timeline_with_filters()
+    test_timeline_uses_fts_table_name_in_match_clause()
     print("\n✅ All mention timeline tests passed!")
