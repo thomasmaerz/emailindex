@@ -20,7 +20,7 @@ def create_test_db():
             body_plain TEXT, x_mailer TEXT, has_attachments INTEGER NOT NULL DEFAULT 0,
             attachments TEXT, folder TEXT NOT NULL, raw_eml BLOB,
             source TEXT DEFAULT 'original', parent_id TEXT, content_hash TEXT,
-            sender TEXT, recipients TEXT, body_text TEXT,
+            sender TEXT, recipients TEXT, body_text TEXT, body_main_text TEXT,
             category_tags TEXT, project_tags TEXT, is_outbound INTEGER,
             embedding BLOB
         )
@@ -33,14 +33,14 @@ def create_test_db():
         name = "Alice" if i % 2 == 0 else "Bob"
         cursor.execute("""
             INSERT INTO emails (id, message_id, thread_id, timestamp, from_address, from_name,
-                to_addresses, subject, body_markdown, body_text, folder, sender, recipients, is_outbound,
+                to_addresses, subject, body_markdown, body_text, body_main_text, folder, sender, recipients, is_outbound,
                 subject_thread_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (uid, f"<thread-{i}@example.com>", thread_id,
               f"2024-01-{10+i:02d}T10:00:00Z", sender, name,
               '["me@example.com"]', "Thread Subject",
               f"Message {i} body content with some details about the discussion",
-              f"Message {i}", "INBOX", sender, '["me@example.com"]', 0, "thread subject"))
+              f"Message {i}", f"Message {i}", "INBOX", sender, '["me@example.com"]', 0, "thread subject"))
 
     conn.commit()
     conn.close()

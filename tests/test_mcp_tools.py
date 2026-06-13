@@ -9,6 +9,7 @@ import tempfile
 import sqlite3
 from pathlib import Path
 from datetime import datetime
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -50,6 +51,7 @@ def create_test_db_with_emails():
             sender TEXT,
             recipients TEXT,
             body_text TEXT,
+            body_main_text TEXT,
             category_tags TEXT,
             project_tags TEXT,
             is_outbound INTEGER
@@ -296,6 +298,7 @@ def test_mcp_server_tools_list():
     """Test that MCPServer exposes all 5 tools."""
     fd, path = tempfile.mkstemp(suffix='.db')
     os.close(fd)
+    original_db = Config.DB_PATH
     
     try:
         conn = sqlite3.connect(path)
@@ -323,6 +326,7 @@ def test_mcp_server_tools_list():
                 sender TEXT,
                 recipients TEXT,
                 body_text TEXT,
+                body_main_text TEXT,
                 category_tags TEXT,
                 project_tags TEXT,
                 is_outbound INTEGER
@@ -341,7 +345,6 @@ def test_mcp_server_tools_list():
         conn.commit()
         conn.close()
         
-        original_db = Config.DB_PATH
         Config.DB_PATH = Path(path)
         
         server = MCPServer()
@@ -354,7 +357,8 @@ def test_mcp_server_tools_list():
             "list_projects",
             "get_mention_timeline",
             "get_contact_profile",
-            "get_thread_arc"
+            "get_thread_arc",
+            "list_threads",
         ]
         
         for tool in expected_tools:
@@ -373,6 +377,52 @@ def test_mcp_server_tools_list():
     finally:
         Config.DB_PATH = original_db
         os.unlink(path)
+
+
+def test_verify_schema_recommends_migrate_body_text_for_missing_body_main_text():
+    fake_conn = Mock()
+    fake_cursor = Mock()
+    fake_conn.cursor.return_value = fake_cursor
+    fake_cursor.fetchall.return_value = [
+        (0, "sender"),
+        (1, "recipients"),
+        (2, "body_text"),
+        (3, "category_tags"),
+        (4, "project_tags"),
+        (5, "is_outbound"),
+    ]
+
+    with patch("mcp_server.server.sqlite3.connect", return_value=fake_conn), \
+         patch("mcp_server.server.sys.exit", side_effect=SystemExit(1)), \
+         patch("sys.stderr.write") as stderr_write:
+        server = MCPServer.__new__(MCPServer)
+        try:
+            server._verify_schema()
+        except SystemExit:
+            pass
+
+    stderr_output = "".join(call.args[0] for call in stderr_write.call_args_list)
+    assert "body_main_text" in stderr_output
+    assert "migrate_body_text.py" in stderr_output
+
+
+def test_verify_schema_recommends_migrate_v2_for_legacy_missing_v2_columns():
+    fake_conn = Mock()
+    fake_cursor = Mock()
+    fake_conn.cursor.return_value = fake_cursor
+    fake_cursor.fetchall.return_value = []
+
+    with patch("mcp_server.server.sqlite3.connect", return_value=fake_conn), \
+         patch("mcp_server.server.sys.exit", side_effect=SystemExit(1)), \
+         patch("sys.stderr.write") as stderr_write:
+        server = MCPServer.__new__(MCPServer)
+        try:
+            server._verify_schema()
+        except SystemExit:
+            pass
+
+    stderr_output = "".join(call.args[0] for call in stderr_write.call_args_list)
+    assert "migrate_v2.py" in stderr_output
 
 
 def test_is_outbound_filter():

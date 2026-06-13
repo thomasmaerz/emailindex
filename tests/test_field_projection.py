@@ -20,7 +20,7 @@ def create_test_db():
             body_plain TEXT, x_mailer TEXT, has_attachments INTEGER NOT NULL DEFAULT 0,
             attachments TEXT, folder TEXT NOT NULL, raw_eml BLOB,
             source TEXT DEFAULT 'original', parent_id TEXT, content_hash TEXT,
-            sender TEXT, recipients TEXT, body_text TEXT,
+            sender TEXT, recipients TEXT, body_text TEXT, body_main_text TEXT,
             category_tags TEXT, project_tags TEXT, is_outbound INTEGER,
             embedding BLOB
         )
@@ -28,15 +28,15 @@ def create_test_db():
     cursor.execute("CREATE VIRTUAL TABLE emails_fts USING fts5(subject, body_markdown, content=emails, content_rowid=rowid)")
     cursor.execute("""
         INSERT INTO emails (id, message_id, timestamp, from_address, from_name,
-            to_addresses, cc_addresses, subject, body_markdown, body_text, folder,
+            to_addresses, cc_addresses, subject, body_markdown, body_text, body_main_text, folder,
             sender, recipients, category_tags, project_tags, is_outbound, subject_thread_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         "550e8400-e29b-41d4-a716-446655440000", "<test@example.com>",
         "2024-01-15T10:00:00Z", "alice@example.com", "Alice Smith",
         '["bob@example.com"]', '["carol@example.com"]', "Project Update",
         "# Full body\n\nThis is a long body with lots of text about the project update.",
-        "Cleaned body text", "INBOX", "legacy-sender@example.com", '["bob@example.com", "carol@example.com"]',
+        "Cleaned body text", "Derived main text", "INBOX", "legacy-sender@example.com", '["bob@example.com", "carol@example.com"]',
         '["work"]', '["ProjectAlpha"]', 0, "project update"
     ))
     cursor.execute("INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)", ("Project Update", "Full body project update"))
@@ -85,16 +85,46 @@ def test_from_address_projection_uses_from_address_column():
         os.unlink(path)
 
 def test_snippet_only_with_fts():
-    """snippet_only should return FTS5 snippet, not full body."""
+    """snippet_only should prefer the FTS5 snippet over body_main_text."""
     path = create_test_db()
     try:
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "UPDATE emails SET body_main_text = ? WHERE id = ?",
+            ("Body main text should not override snippet", "550e8400-e29b-41d4-a716-446655440000"),
+        )
+        conn.commit()
+        conn.close()
         Config.DB_PATH = Path(path)
         result = query_email_database(exact_keywords="project", snippet_only=True)
         r = result["results"][0]
         assert "snippet" in r, "snippet should be present"
         assert "body_text" not in r, "body_text should not be present with snippet_only"
         assert len(r["snippet"]) < 500, f"Snippet too long: {len(r['snippet'])}"
+        assert "<mark>" in r["snippet"] and "</mark>" in r["snippet"]
+        assert "override snippet" not in r["snippet"]
         print("✓ test_snippet_only_with_fts passed")
+    finally:
+        os.unlink(path)
+
+
+def test_custom_snippet_projection_uses_fts_snippet_first():
+    path = create_test_db()
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "UPDATE emails SET body_main_text = ? WHERE id = ?",
+            ("Fallback body main text", "550e8400-e29b-41d4-a716-446655440000"),
+        )
+        conn.commit()
+        conn.close()
+
+        Config.DB_PATH = Path(path)
+        result = query_email_database(exact_keywords="project", fields=["id", "snippet"])
+        r = result["results"][0]
+        assert set(r.keys()) == {"id", "snippet"}
+        assert "<mark>" in r["snippet"] and "</mark>" in r["snippet"]
+        assert "Fallback body main text" not in r["snippet"]
     finally:
         os.unlink(path)
 
@@ -130,6 +160,7 @@ if __name__ == "__main__":
     test_custom_fields_projection()
     test_from_address_projection_uses_from_address_column()
     test_snippet_only_with_fts()
+    test_custom_snippet_projection_uses_fts_snippet_first()
     test_excluded_fields_never_returned()
     test_recipients_in_default()
     print("\n✅ All field projection tests passed!")

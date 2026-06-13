@@ -76,7 +76,7 @@ def create_test_db():
             body_plain TEXT, x_mailer TEXT, has_attachments INTEGER NOT NULL DEFAULT 0,
             attachments TEXT, folder TEXT NOT NULL, raw_eml BLOB,
             source TEXT DEFAULT 'original', parent_id TEXT, content_hash TEXT,
-            sender TEXT, recipients TEXT, body_text TEXT,
+            sender TEXT, recipients TEXT, body_text TEXT, body_main_text TEXT,
             category_tags TEXT, project_tags TEXT, is_outbound INTEGER,
             embedding BLOB
         )
@@ -95,10 +95,10 @@ def create_test_db():
         uid = f"550e8400-0000-0000-0000-000000000{eid}"
         cursor.execute("""
             INSERT INTO emails (id, message_id, timestamp, from_address, from_name,
-                to_addresses, subject, body_markdown, body_text, folder, sender, recipients,
+                to_addresses, subject, body_markdown, body_text, body_main_text, folder, sender, recipients,
                 category_tags, project_tags, is_outbound, subject_thread_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (uid, f"<{eid}@example.com>", ts, sender, name, recip, subj, body, body, "INBOX", sender2, recip, category_tags, project_tags, 0, subj.lower()))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (uid, f"<{eid}@example.com>", ts, sender, name, recip, subj, body, body, body, "INBOX", sender2, recip, category_tags, project_tags, 0, subj.lower()))
         cursor.execute("INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)", (subj, body))
 
     cursor.execute("""
@@ -293,6 +293,114 @@ def test_fts_snippet_query_uses_join_alias():
         result = query_email_database(exact_keywords="John Doe", snippet_only=True, limit=2)
         assert len(result["results"]) >= 1, f"Expected snippet results, got {result}"
         assert "snippet" in result["results"][0], f"Expected snippet field, got {result['results'][0].keys()}"
+    finally:
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
+def test_query_projection_returns_body_main_text_when_requested():
+    path = create_test_db()
+    original_db = Config.DB_PATH
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "UPDATE emails SET body_main_text = ? WHERE subject = ?",
+            ("Cleaner retrieval text.", "Budget update"),
+        )
+        conn.commit()
+        conn.close()
+
+        Config.DB_PATH = Path(path)
+        result = query_email_database(exact_keywords="Project Alpha", limit=1, fields=["id", "body_main_text"])
+
+        assert "body_main_text" in result["results"][0]
+        assert result["results"][0]["body_main_text"] == "Cleaner retrieval text."
+    finally:
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
+def test_default_query_behavior_remains_plaintext_first_and_excludes_salvage():
+    path = create_test_db()
+    original_db = Config.DB_PATH
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """
+            INSERT INTO emails (
+                id, message_id, thread_id, subject_thread_key, timestamp,
+                from_address, from_name, to_addresses, cc_addresses, subject,
+                body_markdown, body_plain, x_mailer, has_attachments, attachments,
+                folder, raw_eml, source, parent_id, content_hash, sender, recipients,
+                body_text, body_main_text, category_tags, project_tags, is_outbound, embedding
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "550e8400-0000-0000-0000-000000000999",
+                "<salvaged@example.com>",
+                "thread-999",
+                "budget update",
+                "2023-01-01T00:00:00Z",
+                "salvager@example.com",
+                "Salvager",
+                '["me@example.com"]',
+                None,
+                "Budget update",
+                "Quoted Alpha block",
+                None,
+                None,
+                0,
+                "[]",
+                "INBOX",
+                None,
+                "quoted_reply",
+                "550e8400-0000-0000-0000-000000000005",
+                "hash-999",
+                "salvager@example.com",
+                '["me@example.com"]',
+                "Project Alpha finance update.",
+                "Quoted Alpha block",
+                "[]",
+                "[]",
+                0,
+                None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)",
+            ("Budget update", "Project Alpha finance update."),
+        )
+        conn.commit()
+        conn.close()
+
+        Config.DB_PATH = Path(path)
+        result = query_email_database(exact_keywords="Project Alpha", limit=5)
+
+        row = result["results"][0]
+        assert row["source"] == "original"
+    finally:
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
+def test_snippet_prefers_fts_match_when_available():
+    path = create_test_db()
+    original_db = Config.DB_PATH
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "UPDATE emails SET body_text = ?, body_main_text = ? WHERE subject = ?",
+            ("Raw footer text signature_logo cid:image001", "Project Alpha finance update.", "Budget update"),
+        )
+        conn.commit()
+        conn.close()
+
+        Config.DB_PATH = Path(path)
+        result = query_email_database(exact_keywords="Project Alpha", snippet_only=True, limit=1)
+
+        assert "<mark>" in result["results"][0]["snippet"]
+        assert "</mark>" in result["results"][0]["snippet"]
+        assert "signature_logo" not in result["results"][0]["snippet"]
     finally:
         Config.DB_PATH = original_db
         os.unlink(path)

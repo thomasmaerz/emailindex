@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""One-time backfill for body_text and FTS5 migration to body_text."""
+"""One-time backfill for body_text/body_main_text and FTS5 migration to body_text."""
 
 from __future__ import annotations
 
 import sqlite3
 import re
 from pathlib import Path
+
+from body_text_cleanup import derive_body_main_text, markdown_to_plain_text
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -30,27 +32,6 @@ def markdown_contains_formatting(markdown_text: str | None) -> bool:
     if not markdown_text:
         return False
     return any(re.search(pattern, markdown_text, flags=re.MULTILINE) for pattern in MARKDOWN_FORMATTING_PATTERNS)
-
-
-def markdown_to_plain_text(markdown_text: str | None) -> str:
-    if not markdown_text:
-        return ""
-    text = markdown_text.replace("\r\n", "\n")
-    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    text = re.sub(r"~~~.*?~~~", " ", text, flags=re.DOTALL)
-    text = re.sub(r"!\[(.*?)\]\([^\)]*\)", r"\1", text)
-    text = re.sub(r"\[(.*?)\]\([^\)]*\)", r"\1", text)
-    text = re.sub(r"(^|\n)#{1,6}\s*", r"\1", text, flags=re.MULTILINE)
-    text = re.sub(r"(^|\n)\s*[-*+]\s+", r"\1", text, flags=re.MULTILINE)
-    text = re.sub(r"(^|\n)\s*\d+\.\s+", r"\1", text, flags=re.MULTILINE)
-    text = re.sub(r"(^|\n)>\s+", r"\1", text, flags=re.MULTILINE)
-    text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
-    text = re.sub(r"__([^_]+)__", r"\1", text)
-    text = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", text)
-    text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return " ".join(text.split())
 
 
 def fts_uses_body_text(cursor: sqlite3.Cursor) -> bool:
@@ -114,7 +95,7 @@ def backfill_body_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor, batch_s
     while True:
         cursor.execute(
             """
-            SELECT rowid, body_markdown, body_plain
+            SELECT rowid, body_markdown, body_plain, body_text, body_main_text
             FROM emails
             WHERE rowid > ?
             ORDER BY rowid
@@ -126,29 +107,39 @@ def backfill_body_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor, batch_s
         if not rows:
             break
 
-        updates: list[tuple[str, int]] = []
-        for rowid, body_markdown, body_plain in rows:
-            has_markdown_formatting = markdown_contains_formatting(body_markdown)
+        updates: list[tuple[str, str, int]] = []
+        for rowid, body_markdown, body_plain, body_text, body_main_text in rows:
+            plain_text = (body_text or "").strip()
+            if not plain_text:
+                has_markdown_formatting = markdown_contains_formatting(body_markdown)
 
-            if has_markdown_formatting:
-                plain_text = markdown_to_plain_text(body_markdown)
-            else:
-                plain_text = (body_markdown or "").strip()
+                if has_markdown_formatting:
+                    plain_text = markdown_to_plain_text(body_markdown)
+                else:
+                    plain_text = (body_markdown or "").strip()
 
-            if not plain_text and body_plain:
-                plain_text = body_plain.strip()
-            if not plain_text and body_markdown and not has_markdown_formatting:
-                plain_text = body_markdown.strip()
+                if not plain_text and body_plain:
+                    plain_text = body_plain.strip()
+                if not plain_text and body_markdown and not has_markdown_formatting:
+                    plain_text = body_markdown.strip()
 
-            updates.append((plain_text, rowid))
+            main_text = (body_main_text or "").strip()
+            if not main_text:
+                main_text = derive_body_main_text(plain_text, body_markdown or "")
+
+            updates.append((plain_text, main_text, rowid))
             last_rowid = rowid
 
-        cursor.executemany("UPDATE emails SET body_text = ? WHERE rowid = ?", updates)
+        cursor.executemany("UPDATE emails SET body_text = ?, body_main_text = ? WHERE rowid = ?", updates)
         conn.commit()
         updated += len(updates)
         print(f"Backfilled {updated}/{total} emails", flush=True)
 
     return updated
+
+
+def backfill_body_main_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor, batch_size: int = 1000) -> int:
+    return backfill_body_text(conn, cursor, batch_size=batch_size)
 
 
 def rebuild_fts(cursor: sqlite3.Cursor) -> None:
@@ -163,6 +154,11 @@ def main() -> None:
     try:
         cursor = conn.cursor()
         cursor.execute("PRAGMA busy_timeout = 60000")
+        cursor.execute("PRAGMA table_info(emails)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "body_main_text" not in columns:
+            cursor.execute("ALTER TABLE emails ADD COLUMN body_main_text TEXT")
+            conn.commit()
         migrate_schema = not fts_uses_body_text(cursor)
         updated = backfill_body_text(conn, cursor)
         drop_fts_objects(cursor)

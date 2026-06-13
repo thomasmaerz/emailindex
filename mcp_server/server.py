@@ -50,13 +50,16 @@ class MCPServer:
         cursor.execute("PRAGMA table_info(emails)")
         columns = {row[1] for row in cursor.fetchall()}
         
-        required_v2_cols = {'sender', 'recipients', 'body_text', 'category_tags', 'project_tags', 'is_outbound'}
+        required_v2_cols = {'sender', 'recipients', 'body_text', 'body_main_text', 'category_tags', 'project_tags', 'is_outbound'}
         missing = required_v2_cols - columns
         
         if missing:
             conn.close()
             print(f"ERROR: Missing required v2 columns: {missing}", file=sys.stderr)
-            print("Run: python migrate_v2.py", file=sys.stderr)
+            if missing == {'body_main_text'}:
+                print("Run: python migrate_body_text.py", file=sys.stderr)
+            else:
+                print("Run: python migrate_v2.py", file=sys.stderr)
             sys.exit(1)
         
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='project_registry'")

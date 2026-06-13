@@ -20,7 +20,7 @@ def create_test_db_with_many_emails():
             body_plain TEXT, x_mailer TEXT, has_attachments INTEGER NOT NULL DEFAULT 0,
             attachments TEXT, folder TEXT NOT NULL, raw_eml BLOB,
             source TEXT DEFAULT 'original', parent_id TEXT, content_hash TEXT,
-            sender TEXT, recipients TEXT, body_text TEXT,
+            sender TEXT, recipients TEXT, body_text TEXT, body_main_text TEXT,
             category_tags TEXT, project_tags TEXT, is_outbound INTEGER,
             embedding BLOB
         )
@@ -32,11 +32,11 @@ def create_test_db_with_many_emails():
         ts = f"2024-{(i % 12) + 1:02d}-{(i % 28) + 1:02d}T10:00:00Z"
         cursor.execute("""
             INSERT INTO emails (id, message_id, timestamp, from_address, from_name,
-                to_addresses, subject, body_markdown, body_text, folder, sender, recipients,
+                to_addresses, subject, body_markdown, body_text, body_main_text, folder, sender, recipients,
                 subject_thread_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (uid, f"<{i}@example.com>", ts, f"user{i}@example.com", f"User {i}",
-              '["me@example.com"]', f"Test email {i}", f"Body {i}", f"Body {i}",
+              '["me@example.com"]', f"Test email {i}", f"Body {i}", f"Body {i}", f"Body {i}",
               "INBOX", f"user{i}@example.com", '["me@example.com"]', f"test email {i}"))
         cursor.execute("INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)", (f"Test {i}", f"Body {i}"))
 
