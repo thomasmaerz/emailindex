@@ -140,7 +140,7 @@ def test_body_main_text_backfills_without_nulls_when_body_text_exists():
             ("# Heading", None, "Heading", None),
         )
 
-        updated = migrate_body_text.backfill_body_main_text(conn, cur, batch_size=10)
+        updated = migrate_body_text.backfill_body_text(conn, cur, batch_size=10)
 
         cur.execute("SELECT body_text, body_main_text FROM emails")
         body_text, body_main_text = cur.fetchone()

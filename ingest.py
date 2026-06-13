@@ -552,27 +552,6 @@ def _cleanup_image_placeholders(text: str) -> str:
     return ' '.join(kept_tokens).strip()
 
 
-def _markdown_to_plain_text(markdown_text: str | None) -> str:
-    if not markdown_text:
-        return ""
-    text = markdown_text.replace("\r\n", "\n")
-    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    text = re.sub(r"~~~.*?~~~", " ", text, flags=re.DOTALL)
-    text = re.sub(r"!\[(.*?)\]\([^\)]*\)", r"\1", text)
-    text = re.sub(r"\[(.*?)\]\([^\)]*\)", r"\1", text)
-    text = re.sub(r"(^|\n)#{1,6}\s*", r"\1", text, flags=re.MULTILINE)
-    text = re.sub(r"(^|\n)\s*[-*+]\s+", r"\1", text, flags=re.MULTILINE)
-    text = re.sub(r"(^|\n)\s*\d+\.\s+", r"\1", text, flags=re.MULTILINE)
-    text = re.sub(r"(^|\n)>\s+", r"\1", text, flags=re.MULTILINE)
-    text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
-    text = re.sub(r"__([^_]+)__", r"\1", text)
-    text = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", text)
-    text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return " ".join(text.split())
-
-
 def _derive_body_main_text(body_text: str, body_markdown: str) -> str:
     return derive_body_main_text(body_text=body_text, body_markdown=body_markdown)
 
