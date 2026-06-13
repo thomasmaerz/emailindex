@@ -383,7 +383,7 @@ def test_default_query_behavior_remains_plaintext_first_and_excludes_salvage():
         os.unlink(path)
 
 
-def test_snippet_prefers_body_main_text_when_available():
+def test_snippet_prefers_fts_match_when_available():
     path = create_test_db()
     original_db = Config.DB_PATH
     try:
@@ -398,7 +398,8 @@ def test_snippet_prefers_body_main_text_when_available():
         Config.DB_PATH = Path(path)
         result = query_email_database(exact_keywords="Project Alpha", snippet_only=True, limit=1)
 
-        assert "Project Alpha finance update." in result["results"][0]["snippet"]
+        assert "<mark>" in result["results"][0]["snippet"]
+        assert "</mark>" in result["results"][0]["snippet"]
         assert "signature_logo" not in result["results"][0]["snippet"]
     finally:
         Config.DB_PATH = original_db

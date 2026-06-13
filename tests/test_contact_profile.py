@@ -20,7 +20,7 @@ def create_test_db():
             body_plain TEXT, x_mailer TEXT, has_attachments INTEGER NOT NULL DEFAULT 0,
             attachments TEXT, folder TEXT NOT NULL, raw_eml BLOB,
             source TEXT DEFAULT 'original', parent_id TEXT, content_hash TEXT,
-            sender TEXT, recipients TEXT, body_text TEXT,
+            sender TEXT, recipients TEXT, body_text TEXT, body_main_text TEXT,
             category_tags TEXT, project_tags TEXT, is_outbound INTEGER,
             embedding BLOB
         )
@@ -29,27 +29,27 @@ def create_test_db():
 
     cursor.execute("""
         INSERT INTO emails (id, message_id, timestamp, from_address, from_name,
-            to_addresses, cc_addresses, subject, body_markdown, body_text, folder,
+            to_addresses, cc_addresses, subject, body_markdown, body_text, body_main_text, folder,
             sender, recipients, is_outbound, subject_thread_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         "550e8400-0001-0000-0000-000000000001", "<1@example.com>",
         "2015-03-01T10:00:00Z", "john@old.com", "John Doe",
         '["me@example.com"]', '[]', "First contact", "Hello from John",
-        "Hello from John", "INBOX", "john@old.com", '["me@example.com"]', 0, "first contact"
+        "Hello from John", "Hello from John", "INBOX", "john@old.com", '["me@example.com"]', 0, "first contact"
     ))
     cursor.execute("INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)", ("First contact", "Hello from John"))
 
     cursor.execute("""
         INSERT INTO emails (id, message_id, timestamp, from_address, from_name,
-            to_addresses, cc_addresses, subject, body_markdown, body_text, folder,
+            to_addresses, cc_addresses, subject, body_markdown, body_text, body_main_text, folder,
             sender, recipients, is_outbound, subject_thread_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         "550e8400-0002-0000-0000-000000000002", "<2@example.com>",
         "2020-07-15T14:00:00Z", "john@new.com", "John Doe",
         '["me@example.com"]', '["carol@example.com"]', "Follow up", "Following up",
-        "Following up", "INBOX", "john@new.com", '["me@example.com", "carol@example.com"]', 0, "follow up"
+        "Following up", "Following up", "INBOX", "john@new.com", '["me@example.com", "carol@example.com"]', 0, "follow up"
     ))
     cursor.execute("INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)", ("Follow up", "Following up"))
 

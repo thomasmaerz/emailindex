@@ -56,7 +56,10 @@ class MCPServer:
         if missing:
             conn.close()
             print(f"ERROR: Missing required v2 columns: {missing}", file=sys.stderr)
-            print("Run: python migrate_v2.py", file=sys.stderr)
+            if missing == {'body_main_text'}:
+                print("Run: python migrate_body_text.py", file=sys.stderr)
+            else:
+                print("Run: python migrate_v2.py", file=sys.stderr)
             sys.exit(1)
         
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='project_registry'")

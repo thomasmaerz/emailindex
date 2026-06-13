@@ -20,7 +20,7 @@ def create_test_db():
             body_plain TEXT, x_mailer TEXT, has_attachments INTEGER NOT NULL DEFAULT 0,
             attachments TEXT, folder TEXT NOT NULL, raw_eml BLOB,
             source TEXT DEFAULT 'original', parent_id TEXT, content_hash TEXT,
-            sender TEXT, recipients TEXT, body_text TEXT,
+            sender TEXT, recipients TEXT, body_text TEXT, body_main_text TEXT,
             category_tags TEXT, project_tags TEXT, is_outbound INTEGER,
             embedding BLOB
         )
@@ -34,12 +34,12 @@ def create_test_db():
             body_markdown = f"John Doe mentioned in {year} ftsonlytoken{year}{i}"
             cursor.execute("""
                 INSERT INTO emails (id, message_id, timestamp, from_address, from_name,
-                    to_addresses, subject, body_markdown, body_text, folder, sender, recipients,
+                    to_addresses, subject, body_markdown, body_text, body_main_text, folder, sender, recipients,
                     subject_thread_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (uid, f"<{year}-{i}@example.com>", ts, "alice@example.com", "Alice",
                   '["me@example.com"]', f"Mention {year}-{i}", body_markdown,
-                  f"John Doe {year}", "INBOX", "alice@example.com", '["me@example.com"]', f"mention {year}"))
+                  f"John Doe {year}", f"John Doe {year}", "INBOX", "alice@example.com", '["me@example.com"]', f"mention {year}"))
             cursor.execute("INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)", (f"Mention {year}", body_markdown))
 
     conn.commit()

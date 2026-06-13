@@ -31,7 +31,7 @@ import zstandard as zstd
 from sentence_transformers import SentenceTransformer
 from email_reply_parser import EmailReplyParser
 
-from migrate_body_text import markdown_to_plain_text
+from body_text_cleanup import derive_body_main_text, markdown_to_plain_text
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "db" / "emails.db"
@@ -574,31 +574,7 @@ def _markdown_to_plain_text(markdown_text: str | None) -> str:
 
 
 def _derive_body_main_text(body_text: str, body_markdown: str) -> str:
-    source = (body_text or '').strip()
-    if not source:
-        source = _markdown_to_plain_text(body_markdown) if body_markdown else ''
-    if not source:
-        source = (body_markdown or '').strip()
-
-    cleaned = _strip_reply_headers(source)
-    cleaned = _strip_signatures(cleaned)
-    cleaned = _strip_disclaimers(cleaned)
-    cleaned = _flatten_layout_artifacts(cleaned)
-    cleaned = _cleanup_image_placeholders(cleaned)
-    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-    
-    cleaned_stripped = cleaned.strip()
-    if not cleaned_stripped and source.strip():
-        # Fallback to basic layout/image cleaning if aggressive signatures/disclaimers
-        # stripped the entire email.
-        cleaned = _flatten_layout_artifacts(source)
-        cleaned = _cleanup_image_placeholders(cleaned)
-        cleaned = re.sub(r'[ \t]+', ' ', cleaned)
-        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-        cleaned_stripped = cleaned.strip()
-        
-    return cleaned_stripped
+    return derive_body_main_text(body_text=body_text, body_markdown=body_markdown)
 
 
 def _normalize_for_hash(text: str) -> str:

@@ -20,19 +20,19 @@ def create_test_db():
             body_plain TEXT, x_mailer TEXT, has_attachments INTEGER NOT NULL DEFAULT 0,
             attachments TEXT, folder TEXT NOT NULL, raw_eml BLOB,
             source TEXT DEFAULT 'original', parent_id TEXT, content_hash TEXT,
-            sender TEXT, recipients TEXT, body_text TEXT,
+            sender TEXT, recipients TEXT, body_text TEXT, body_main_text TEXT,
             category_tags TEXT, project_tags TEXT, is_outbound INTEGER,
             embedding BLOB
         )
     """)
     cursor.execute("""
         INSERT INTO emails (id, message_id, timestamp, from_address, from_name,
-            to_addresses, subject, body_markdown, body_text, folder, sender, recipients, subject_thread_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            to_addresses, subject, body_markdown, body_text, body_main_text, folder, sender, recipients, subject_thread_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         "550e8400-e29b-41d4-a716-446655440000", "<test@example.com>",
         "2024-01-15T10:00:00Z", "alice@example.com", "Alice",
-        '["bob@example.com"]', "Test", "Test body", "Test body",
+        '["bob@example.com"]', "Test", "Test body", "Test body", "Preferred body main text",
         "INBOX", "alice@example.com", '["bob@example.com"]', "test"
     ))
     conn.commit()
@@ -77,6 +77,21 @@ def test_get_email_excludes_embedding():
         dumped = result.model_dump(mode='json')
         assert "embedding" not in dumped, f"embedding should not be in response, got keys: {dumped.keys()}"
         print("✓ test_get_email_excludes_embedding passed")
+    finally:
+        close_connection()
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
+def test_get_email_returns_selected_body_main_text_column():
+    path = create_test_db()
+    original_db = Config.DB_PATH
+    try:
+        Config.DB_PATH = Path(path)
+
+        result = get_email("550e8400-e29b-41d4-a716-446655440000")
+        assert result is not None
+        assert result.body_main_text == "Preferred body main text"
     finally:
         close_connection()
         Config.DB_PATH = original_db
@@ -131,6 +146,27 @@ def test_get_conversation_primary_thread_path_excludes_blob_fields():
         assert "embedding" not in dumped["emails"][0], (
             f"embedding should not be in primary thread response, got keys: {dumped['emails'][0].keys()}"
         )
+    finally:
+        close_connection()
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
+def test_get_conversation_returns_selected_body_main_text_column():
+    path = create_test_db()
+    original_db = Config.DB_PATH
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "UPDATE emails SET thread_id = 'thread-real' WHERE id = '550e8400-e29b-41d4-a716-446655440000'"
+        )
+        conn.commit()
+        conn.close()
+
+        Config.DB_PATH = Path(path)
+        result = get_conversation("thread-real")
+        assert result is not None
+        assert result.emails[0].body_main_text == "Preferred body main text"
     finally:
         close_connection()
         Config.DB_PATH = original_db

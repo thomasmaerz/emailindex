@@ -494,8 +494,25 @@ class TestSalvageQualityGuards:
             conn.close()
 
     def test_parent_body_text_is_not_destructively_rewritten_by_salvage(self):
-        original = "Reply text that should remain unchanged."
-        parent = SAMPLE_PARENT.copy()
-        parent['body_text'] = original
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
 
-        assert parent['body_text'] == original
+            original = "Reply text that should remain unchanged."
+            parent = SAMPLE_PARENT.copy()
+            parent['body_text'] = original
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+
+            salvage_quotes(
+                plain_text=(
+                    "Reply text that should remain unchanged.\n\n"
+                    "From: Bob <bob@example.com>\nSent: Monday\nTo: Alice\nSubject: Test\n\n"
+                    "Useful quoted fragment that is long enough to salvage for testing."
+                ),
+                html_text=None,
+                parent_record=parent,
+                conn=conn,
+            )
+
+            assert parent['body_text'] == original
+            conn.close()

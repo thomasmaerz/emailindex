@@ -86,7 +86,7 @@ class EmailRecord(BaseModel):
             subject=row.get('subject', ''),
             body_markdown=row.get('body_markdown', ''),
             body_plain=row.get('body_plain'),
-            body_main_text=row.get('body_main_text', row.get('body_text', row.get('body_markdown', ''))),
+            body_main_text=row.get('body_main_text') or row.get('body_text', row.get('body_markdown', '')),
             x_mailer=row.get('x_mailer'),
             has_attachments=bool(row.get('has_attachments', 0)),
             attachments=attachments,
