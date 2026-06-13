@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mcp_server.database import get_email, get_conversation, close_connection
 from mcp_server.config import Config
+from mcp_server.models import EmailRecord
 
 def create_test_db():
     fd, path = tempfile.mkstemp(suffix='.db')
@@ -34,6 +35,40 @@ def create_test_db():
         "2024-01-15T10:00:00Z", "alice@example.com", "Alice",
         '["bob@example.com"]', "Test", "Test body", "Test body", "Preferred body main text",
         "INBOX", "alice@example.com", '["bob@example.com"]', "test"
+    ))
+    conn.commit()
+    conn.close()
+    return path
+
+
+def create_legacy_test_db():
+    fd, path = tempfile.mkstemp(suffix='.db')
+    os.close(fd)
+    conn = sqlite3.connect(path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE emails (
+            id TEXT PRIMARY KEY, message_id TEXT UNIQUE NOT NULL,
+            thread_id TEXT, subject_thread_key TEXT, timestamp TEXT NOT NULL,
+            from_address TEXT NOT NULL, from_name TEXT, to_addresses TEXT NOT NULL,
+            cc_addresses TEXT, subject TEXT NOT NULL, body_markdown TEXT NOT NULL,
+            body_plain TEXT, x_mailer TEXT, has_attachments INTEGER NOT NULL DEFAULT 0,
+            attachments TEXT, folder TEXT NOT NULL, raw_eml BLOB,
+            source TEXT DEFAULT 'original', parent_id TEXT, content_hash TEXT,
+            sender TEXT, recipients TEXT, body_text TEXT,
+            category_tags TEXT, project_tags TEXT, is_outbound INTEGER,
+            embedding BLOB
+        )
+    """)
+    cursor.execute("""
+        INSERT INTO emails (id, message_id, thread_id, timestamp, from_address, from_name,
+            to_addresses, subject, body_markdown, body_text, folder, sender, recipients, subject_thread_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "550e8400-e29b-41d4-a716-446655440000", "<legacy@example.com>", "thread-legacy",
+        "2024-01-15T10:00:00Z", "alice@example.com", "Alice", '["bob@example.com"]',
+        "Legacy Test", "Legacy markdown body", None, "INBOX", "alice@example.com",
+        '["bob@example.com"]', "legacy test"
     ))
     conn.commit()
     conn.close()
@@ -167,6 +202,54 @@ def test_get_conversation_returns_selected_body_main_text_column():
         result = get_conversation("thread-real")
         assert result is not None
         assert result.emails[0].body_main_text == "Preferred body main text"
+    finally:
+        close_connection()
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
+def test_email_record_from_db_row_coalesces_null_text_fields_to_empty_string():
+    row = {
+        "id": "550e8400-e29b-41d4-a716-446655440000",
+        "message_id": "<test@example.com>",
+        "timestamp": "2024-01-15T10:00:00Z",
+        "from_address": "alice@example.com",
+        "to_addresses": '["bob@example.com"]',
+        "subject": "Null text fields",
+        "body_markdown": None,
+        "body_plain": None,
+        "body_text": None,
+        "body_main_text": None,
+        "folder": "INBOX",
+    }
+
+    record = EmailRecord.from_db_row(row)
+    assert record.body_text == ""
+    assert record.body_main_text == ""
+
+
+def test_get_email_works_on_legacy_schema_without_body_main_text():
+    path = create_legacy_test_db()
+    original_db = Config.DB_PATH
+    try:
+        Config.DB_PATH = Path(path)
+        result = get_email("550e8400-e29b-41d4-a716-446655440000")
+        assert result is not None
+        assert result.body_main_text == "Legacy markdown body"
+    finally:
+        close_connection()
+        Config.DB_PATH = original_db
+        os.unlink(path)
+
+
+def test_get_conversation_works_on_legacy_schema_without_body_main_text():
+    path = create_legacy_test_db()
+    original_db = Config.DB_PATH
+    try:
+        Config.DB_PATH = Path(path)
+        result = get_conversation("thread-legacy")
+        assert result is not None
+        assert result.emails[0].body_main_text == "Legacy markdown body"
     finally:
         close_connection()
         Config.DB_PATH = original_db

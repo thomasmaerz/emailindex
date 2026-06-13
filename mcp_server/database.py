@@ -89,6 +89,12 @@ def _main_text_select_expr(has_main_text: bool) -> str:
     return "COALESCE(e.body_text, e.body_markdown)"
 
 
+def _main_text_select_expr_no_alias(has_main_text: bool) -> str:
+    if has_main_text:
+        return "COALESCE(NULLIF(body_main_text, ''), body_text, body_markdown)"
+    return "COALESCE(body_text, body_markdown)"
+
+
 def _encode_cursor(timestamp: str, email_id: str) -> str:
     data = json.dumps({"ts": timestamp, "id": email_id})
     return base64.b64encode(data.encode()).decode()
@@ -378,14 +384,18 @@ def search_emails(
 def get_email(email_id: str) -> Optional[EmailRecord]:
     conn = get_connection()
     cursor = conn.cursor()
+    has_main_text = _check_has_body_main_text(cursor)
+    select_main_text = _main_text_select_expr_no_alias(has_main_text)
     
     # Explicitly exclude raw_eml and embedding — these must never appear in MCP responses
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT id, message_id, thread_id, subject_thread_key, timestamp,
                from_address, from_name, to_addresses, cc_addresses, subject,
                body_markdown, body_plain, x_mailer, has_attachments, attachments,
                folder, source, parent_id, content_hash, sender, recipients,
-               body_text, body_main_text, category_tags, project_tags, is_outbound
+               COALESCE(body_text, body_markdown) as body_text,
+               {select_main_text} as body_main_text,
+               category_tags, project_tags, is_outbound
         FROM emails WHERE id = ?
     """, (email_id,))
     row = cursor.fetchone()
@@ -403,11 +413,16 @@ def get_email(email_id: str) -> Optional[EmailRecord]:
 def get_conversation(thread_id: str) -> Optional[ConversationThread]:
     conn = get_connection()
     cursor = conn.cursor()
+    has_main_text = _check_has_body_main_text(cursor)
+    select_main_text = _main_text_select_expr_no_alias(has_main_text)
 
-    conversation_columns = """
+    conversation_columns = f"""
         id, message_id, thread_id, subject_thread_key, timestamp,
         from_address, from_name, to_addresses, cc_addresses, subject,
-        body_markdown, body_plain, body_text, body_main_text, x_mailer, has_attachments,
+        body_markdown, body_plain,
+        COALESCE(body_text, body_markdown) as body_text,
+        {select_main_text} as body_main_text,
+        x_mailer, has_attachments,
         attachments, folder, source, parent_id, content_hash, sender,
         recipients, category_tags, project_tags, is_outbound
     """

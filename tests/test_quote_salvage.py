@@ -11,10 +11,14 @@ import sqlite3
 import tempfile
 import pytest
 import sys
+import re
 from pathlib import Path
+import numpy as np
 
 BASE_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(BASE_DIR))
+
+import ingest
 
 from ingest import (
     salvage_quotes,
@@ -28,6 +32,23 @@ from ingest import (
     _encode_text_to_embedding,
     insert_email,
 )
+
+
+def _fake_encode_text_to_embedding(text: str) -> bytes:
+    tokens = re.findall(r"[a-z0-9]+", text.lower())[:20]
+    vector = np.zeros(16, dtype=np.float32)
+    for token in tokens:
+        vector[hash(token) % len(vector)] += 1.0
+    norm = np.linalg.norm(vector)
+    if norm:
+        vector /= norm
+    return vector.astype(np.float32).tobytes()
+
+
+@pytest.fixture(autouse=True)
+def _patch_test_embeddings(monkeypatch):
+    monkeypatch.setattr(ingest, "_encode_text_to_embedding", _fake_encode_text_to_embedding)
+    monkeypatch.setattr(sys.modules[__name__], "_encode_text_to_embedding", _fake_encode_text_to_embedding)
 
 SAMPLE_PARENT = {
     'id': 'test-parent-001',
