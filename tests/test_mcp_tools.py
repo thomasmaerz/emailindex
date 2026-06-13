@@ -50,6 +50,7 @@ def create_test_db_with_emails():
             sender TEXT,
             recipients TEXT,
             body_text TEXT,
+            body_main_text TEXT,
             category_tags TEXT,
             project_tags TEXT,
             is_outbound INTEGER
@@ -323,6 +324,7 @@ def test_mcp_server_tools_list():
                 sender TEXT,
                 recipients TEXT,
                 body_text TEXT,
+                body_main_text TEXT,
                 category_tags TEXT,
                 project_tags TEXT,
                 is_outbound INTEGER

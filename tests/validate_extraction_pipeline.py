@@ -326,6 +326,68 @@ def check_no_raw_html_in_body() -> tuple[bool, str, dict]:
         return False, f"{raw_html} emails may have raw HTML in body", result
 
 
+def fetch_sample_rows(conn: sqlite3.Connection, sample_size: int):
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    bounded_size = sample_size if sample_size > 0 else 50
+    c.execute("PRAGMA table_info(emails)")
+    columns = {row[1] for row in c.fetchall()}
+    order_clause = "ORDER BY timestamp DESC" if "timestamp" in columns else "ORDER BY rowid DESC"
+    c.execute(
+        f"""
+        SELECT id, subject, body_markdown, body_text, source
+        FROM emails
+        {order_clause}
+        LIMIT ?
+        """,
+        (bounded_size,),
+    )
+    return c.fetchall()
+
+
+def check_sample_plaintext_quality(sample_size: int = 50) -> tuple[bool, str, dict]:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = fetch_sample_rows(conn, sample_size)
+        empty = 0
+        for row in rows:
+            text = (row["body_text"] or row["body_markdown"] or "").strip()
+            if not text:
+                empty += 1
+        result = {"checked": len(rows), "empty": empty}
+        if empty == 0:
+            return True, f"All {len(rows)} sampled rows have retrieval text", result
+        return False, f"{empty}/{len(rows)} sampled rows are empty", result
+    finally:
+        conn.close()
+
+
+def check_full_quoted_reply_integrity() -> tuple[bool, str, dict]:
+    checks = [
+        check_salvage_quotes,
+        check_content_hash_uniqueness,
+        check_parent_child_relationship,
+        check_mcp_filters_quoted_replies,
+        check_salvage_content_quality,
+        check_salvage_rate_analysis,
+        check_signature_stripping,
+        check_semantic_dedup,
+        check_html_only_emails,
+    ]
+
+    combined = {}
+    failures = []
+    for check in checks:
+        passed, message, detail = check()
+        combined[check.__name__] = detail
+        if not passed:
+            failures.append(f"{check.__name__}: {message}")
+
+    if failures:
+        return False, "; ".join(failures), combined
+    return True, "Full quoted-reply integrity checks passed", combined
+
+
 def check_salvage_quotes() -> tuple[bool, str, dict]:
     """Verify quoted_reply records exist with valid parent_id and content_hash."""
     conn = sqlite3.connect(DB_PATH)
@@ -682,16 +744,11 @@ def run_validation(sample_size: int = 50, verbose: bool = False) -> dict:
         ("Vector Coverage", lambda: check_vector_coverage()),
         ("has_attachments Accuracy", lambda: check_has_attachments_accuracy(sample_size)),
         ("No Raw HTML in Body", lambda: check_no_raw_html_in_body()),
-        ("Salvage Quotes", lambda: check_salvage_quotes()),
-        ("Content Hash Uniqueness", lambda: check_content_hash_uniqueness()),
-        ("Parent-Child Relationship", lambda: check_parent_child_relationship()),
-        ("MCP Filters Quoted Replies", lambda: check_mcp_filters_quoted_replies()),
-        ("Salvage Content Quality", lambda: check_salvage_content_quality()),
-        ("Salvage Rate Analysis", lambda: check_salvage_rate_analysis()),
-        ("Signature Stripping", lambda: check_signature_stripping()),
-        ("Semantic Dedup", lambda: check_semantic_dedup()),
-        ("HTML-Only Emails", lambda: check_html_only_emails()),
+        ("Sample Plaintext Quality", lambda: check_sample_plaintext_quality(sample_size)),
     ]
+
+    if sample_size <= 0:
+        checks.append(("Quoted Reply Integrity", lambda: check_full_quoted_reply_integrity()))
     
     all_passed = True
     

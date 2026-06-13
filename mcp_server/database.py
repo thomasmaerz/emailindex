@@ -21,7 +21,7 @@ DEFAULT_FIELDS = [
 ALLOWED_FIELDS = {
     "id", "thread_id", "subject_thread_key", "timestamp", "from_address",
     "from_name", "to_addresses", "cc_addresses", "recipients", "subject",
-    "body_text", "body_markdown", "body_plain", "has_attachments",
+    "body_text", "body_main_text", "body_markdown", "body_plain", "has_attachments",
     "attachments", "folder", "is_outbound", "category_tags", "project_tags",
     "parent_id", "source", "content_hash", "message_id", "x_mailer",
     "relevance_score", "snippet"
@@ -31,7 +31,16 @@ ALLOWED_FIELDS = {
 EXCLUDED_FIELDS = {"raw_eml", "embedding"}
 
 
-def _build_select_columns(fields):
+def _check_has_body_main_text(cursor_conn):
+    try:
+        cursor_conn.execute("PRAGMA table_info(emails)")
+        columns = {row[1] for row in cursor_conn.fetchall()}
+        return "body_main_text" in columns
+    except Exception:
+        return False
+
+
+def _build_select_columns(fields, has_main_text=True):
     """Build SQL column list for field projection."""
     if fields is None:
         fields = DEFAULT_FIELDS
@@ -50,6 +59,7 @@ def _build_select_columns(fields):
         "recipients": "e.recipients",
         "subject": "e.subject",
         "body_text": "COALESCE(e.body_text, e.body_markdown) as body_text",
+        "body_main_text": "COALESCE(NULLIF(e.body_main_text, ''), e.body_text, e.body_markdown) as body_main_text" if has_main_text else "COALESCE(e.body_text, e.body_markdown) as body_main_text",
         "body_markdown": "e.body_markdown",
         "body_plain": "e.body_plain",
         "has_attachments": "e.has_attachments",
@@ -584,6 +594,9 @@ def query_email_database(
     # Determine if we need snippet (check before semantic query path)
     use_snippet = snippet_only and (bool(fts_query) or semantic_query)
     
+    # Check if DB has body_main_text column
+    has_main_text = _check_has_body_main_text(cursor_conn)
+    
     # Handle semantic query (vector search)
     if semantic_query and not fts_query:
         try:
@@ -592,10 +605,13 @@ def query_email_database(
             close_connection()
             return {"error": f"Failed to encode semantic query: {e}", "results": []}
 
+        select_main_text = "COALESCE(NULLIF(e.body_main_text, ''), e.body_text, e.body_markdown) as body_main_text" if has_main_text else "COALESCE(e.body_text, e.body_markdown) as body_main_text"
+
         sql = f"""
             SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                    e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
                    COALESCE(e.body_text, e.body_markdown) as body_text,
+                   {select_main_text},
                    -- NOTE: This query performs a brute-force full-table scan over email_vectors.
                    -- sqlite-vec v0.1.8+ supports ANN indexes, but the current schema and queries
                    -- in this codebase do not create or use them for this path.
@@ -617,6 +633,7 @@ def query_email_database(
         for row in results:
             row_dict = dict(row)
             body_text = row_dict.get("body_text", "")
+            body_main_text = row_dict.get("body_main_text") or body_text
             item = {
                 "id": row_dict["id"],
                 "thread_id": row_dict.get("thread_id"),
@@ -632,7 +649,7 @@ def query_email_database(
                 "relevance_score": row_dict["relevance_score"],
             }
             if use_snippet:
-                item["snippet"] = body_text[:300] if body_text else ""
+                item["snippet"] = body_main_text[:300] if body_main_text else ""
             output.append(item)
         
         close_connection()
@@ -671,10 +688,12 @@ def query_email_database(
     use_snippet = snippet_only and (bool(fts_query) or semantic_query)
 
     # Build SELECT columns
+    select_main_text = "COALESCE(NULLIF(e.body_main_text, ''), e.body_text, e.body_markdown) as body_main_text" if has_main_text else "COALESCE(e.body_text, e.body_markdown) as body_main_text"
     if use_snippet:
         sql = f"""
                 SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                        e.from_name, e.has_attachments, e.folder,
+                       {select_main_text},
                        snippet(emails_fts, 1, '<mark>', '</mark>', '...', {snippet_length}) as snippet,
                        bm25(emails_fts) as rank
                 {from_clause}
@@ -684,7 +703,7 @@ def query_email_database(
         """
         use_fts_join = True
     elif fields is not None:
-        columns = _build_select_columns(fields)
+        columns = _build_select_columns(fields, has_main_text=has_main_text)
         if use_fts_join:
             sql = f"""
                 SELECT {columns}, bm25(emails_fts) as rank
@@ -706,7 +725,9 @@ def query_email_database(
             sql = f"""
                 SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                        e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
-                       COALESCE(e.body_text, e.body_markdown) as body_text, bm25(emails_fts) as rank
+                       COALESCE(e.body_text, e.body_markdown) as body_text,
+                       {select_main_text},
+                       bm25(emails_fts) as rank
                 {from_clause}
                 WHERE {where_sql}
                 {order_clause}
@@ -716,7 +737,8 @@ def query_email_database(
             sql = f"""
                 SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
                        e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
-                       COALESCE(e.body_text, e.body_markdown) as body_text
+                       COALESCE(e.body_text, e.body_markdown) as body_text,
+                       {select_main_text}
                 FROM emails e
                 WHERE {where_sql}
                 {order_clause}
@@ -749,6 +771,7 @@ def query_email_database(
     thread_ids = set()
     for i, row in enumerate(results):
         if use_snippet:
+            preferred_snippet = row["body_main_text"] or row["snippet"]
             item = {
                 "id": row["id"],
                 "thread_id": row["thread_id"],
@@ -756,7 +779,7 @@ def query_email_database(
                 "timestamp": row["timestamp"],
                 "from_address": row["from_address"],
                 "from_name": row["from_name"],
-                "snippet": row["snippet"],
+                "snippet": preferred_snippet[:500] if preferred_snippet else "",
                 "has_attachments": bool(row["has_attachments"]),
                 "folder": row["folder"],
             }
@@ -770,7 +793,8 @@ def query_email_database(
                 if f == "relevance_score":
                     item[f] = rank_values[i] if i < len(rank_values) else None
                 elif f == "snippet":
-                    item[f] = row_dict.get("body_text", "")[:500] if row_dict.get("body_text") else ""
+                    snippet_text = row_dict.get("body_main_text") or row_dict.get("body_text") or ""
+                    item[f] = snippet_text[:500] if snippet_text else ""
                 elif f in ("category_tags", "project_tags", "recipients", "to_addresses", "cc_addresses", "attachments"):
                     val = row_dict.get(f)
                     item[f] = json.loads(val) if val else []

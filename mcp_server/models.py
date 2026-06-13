@@ -40,6 +40,7 @@ class EmailRecord(BaseModel):
     subject: str = Field(..., description="Raw subject line")
     body_markdown: str = Field(..., description="HTML→Markdown converted body")
     body_plain: Optional[str] = Field(None, description="Plain text fallback")
+    body_main_text: str = Field(..., description="Retrieval-oriented cleaned body text")
     x_mailer: Optional[str] = Field(None, description="X-Mailer or User-Agent header")
     
     has_attachments: bool = Field(..., description="Whether email has attachments")
@@ -85,6 +86,7 @@ class EmailRecord(BaseModel):
             subject=row.get('subject', ''),
             body_markdown=row.get('body_markdown', ''),
             body_plain=row.get('body_plain'),
+            body_main_text=row.get('body_main_text', row.get('body_text', row.get('body_markdown', ''))),
             x_mailer=row.get('x_mailer'),
             has_attachments=bool(row.get('has_attachments', 0)),
             attachments=attachments,

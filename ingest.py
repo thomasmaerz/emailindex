@@ -31,6 +31,8 @@ import zstandard as zstd
 from sentence_transformers import SentenceTransformer
 from email_reply_parser import EmailReplyParser
 
+from migrate_body_text import markdown_to_plain_text
+
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "db" / "emails.db"
 ATTACHMENTS_DIR = BASE_DIR / "attachments"
@@ -360,11 +362,12 @@ class Converter:
 
     @staticmethod
     def format_size(bytes_val: int) -> str:
+        size = float(bytes_val)
         for unit in ['B', 'KB', 'MB', 'GB']:
-            if bytes_val < 1024:
-                return f"{bytes_val:.1f} {unit}"
-            bytes_val /= 1024
-        return f"{bytes_val:.1f} TB"
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
 
 
 def compute_sha256(content: bytes) -> str:
@@ -414,12 +417,188 @@ _SIGNATURE_STRIP_PATTERNS = [
     r'^On\s.*\swrote:$',
 ]
 
+_DISCLAIMER_STRIP_PATTERNS = [
+    r'(?is)\bCONFIDENTIALITY NOTICE\b.*$',
+    r'(?is)\bThis message and any attachments\b.*$',
+    r'(?is)\bThis e-?mail and any attachments\b.*$',
+    r'(?is)\bThis communication may contain confidential\b.*$',
+]
+
+_GENERIC_IMAGE_TOKEN_PATTERNS = [
+    r'(?i)^cid:image\d+$',
+    r'(?i)^image\d+$',
+    r'(?i)^img\d+$',
+    r'(?i)^signature$',
+    r'(?i)^signature[_-]?logo$',
+    r'(?i)^logo$',
+    r'(?i)^image$',
+]
+
 
 def _strip_signatures(text: str) -> str:
     """Remove signature noise from text fragment."""
     for pattern in _SIGNATURE_STRIP_PATTERNS:
         text = re.sub(pattern, '', text, flags=re.MULTILINE)
     return text
+
+
+def _is_meaningful_candidate(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = text
+    for pattern in (
+        r'(?i)Sent from my (iPhone|Android|Galaxy|iPad|handheld).*',
+        r'(?i)Get (Outlook|Mail) for (iOS|Android|Mobile).*',
+        r'(?i)Sent from Gmail.*',
+        r'(?i)Begin forwarded message:.*',
+        r'(?i)Forwarded message:.*',
+    ):
+        cleaned = re.sub(pattern, '', cleaned, flags=re.MULTILINE)
+    
+    cleaned = cleaned.strip()
+    if len(cleaned) < 15:
+        return False
+    if not re.search(r'[a-zA-Z0-9]', cleaned):
+        return False
+    return True
+
+
+def _strip_reply_headers(text: str) -> str:
+    """Drop quoted reply headers when fresh content appears above them."""
+    if not text:
+        return ""
+
+    header_markers = (
+        "\nFrom:",
+        "\n-----Original Message-----",
+        "\nOn ",
+    )
+    for marker in header_markers:
+        idx = text.find(marker)
+        if idx > 0:
+            candidate = text[:idx].strip()
+            if _is_meaningful_candidate(candidate):
+                return candidate
+    return text
+
+
+def _strip_disclaimers(text: str) -> str:
+    if not text:
+        return ""
+    for pattern in _DISCLAIMER_STRIP_PATTERNS:
+        text = re.sub(pattern, '', text)
+    return text
+
+
+def _flatten_layout_artifacts(text: str) -> str:
+    if not text:
+        return ""
+
+    lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r'^[|:\s-]+$', line):
+            continue
+        if re.match(r'^[|\s]+$', line):
+            continue
+        if '|' in line:
+            cells = [c.strip() for c in line.split('|')]
+            cleaned_cells = []
+            for cell in cells:
+                if not cell:
+                    continue
+                if re.match(r'^[:-]+$', cell):
+                    continue
+                cell_clean = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', cell)
+                cell_clean = cell_clean.strip()
+                if cell_clean:
+                    cleaned_cells.append(cell_clean)
+            if cleaned_cells:
+                line = " ".join(cleaned_cells)
+            else:
+                continue
+        lines.append(line)
+
+    text = "\n".join(lines)
+    text = re.sub(r'<img[^>]*>', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'mailto:\S+', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'cid:\S+', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\|\s*\|\s*\|', ' ', text)
+    return text
+
+
+def _cleanup_image_placeholders(text: str) -> str:
+    if not text:
+        return ""
+
+    text = re.sub(r'cid:image\d+(?:\.[a-z0-9]+)?', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?i)signature[_ -]?logo', ' ', text)
+
+    kept_tokens = []
+    tokens = text.split()
+    for idx, token in enumerate(tokens):
+        normalized = re.sub(r'[^a-z0-9:_-]', '', token.lower())
+        if normalized == 'logo':
+            prev_normalized = re.sub(r'[^a-z0-9:_-]', '', tokens[idx - 1].lower()) if idx > 0 else ''
+            if prev_normalized and prev_normalized not in {'signature', 'image', 'image001'}:
+                kept_tokens.append(token)
+                continue
+        if any(re.fullmatch(pattern, normalized) for pattern in _GENERIC_IMAGE_TOKEN_PATTERNS):
+            continue
+        kept_tokens.append(token)
+
+    return ' '.join(kept_tokens).strip()
+
+
+def _markdown_to_plain_text(markdown_text: str | None) -> str:
+    if not markdown_text:
+        return ""
+    text = markdown_text.replace("\r\n", "\n")
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"~~~.*?~~~", " ", text, flags=re.DOTALL)
+    text = re.sub(r"!\[(.*?)\]\([^\)]*\)", r"\1", text)
+    text = re.sub(r"\[(.*?)\]\([^\)]*\)", r"\1", text)
+    text = re.sub(r"(^|\n)#{1,6}\s*", r"\1", text, flags=re.MULTILINE)
+    text = re.sub(r"(^|\n)\s*[-*+]\s+", r"\1", text, flags=re.MULTILINE)
+    text = re.sub(r"(^|\n)\s*\d+\.\s+", r"\1", text, flags=re.MULTILINE)
+    text = re.sub(r"(^|\n)>\s+", r"\1", text, flags=re.MULTILINE)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split())
+
+
+def _derive_body_main_text(body_text: str, body_markdown: str) -> str:
+    source = (body_text or '').strip()
+    if not source:
+        source = _markdown_to_plain_text(body_markdown) if body_markdown else ''
+    if not source:
+        source = (body_markdown or '').strip()
+
+    cleaned = _strip_reply_headers(source)
+    cleaned = _strip_signatures(cleaned)
+    cleaned = _strip_disclaimers(cleaned)
+    cleaned = _flatten_layout_artifacts(cleaned)
+    cleaned = _cleanup_image_placeholders(cleaned)
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    
+    cleaned_stripped = cleaned.strip()
+    if not cleaned_stripped and source.strip():
+        # Fallback to basic layout/image cleaning if aggressive signatures/disclaimers
+        # stripped the entire email.
+        cleaned = _flatten_layout_artifacts(source)
+        cleaned = _cleanup_image_placeholders(cleaned)
+        cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        cleaned_stripped = cleaned.strip()
+        
+    return cleaned_stripped
 
 
 def _normalize_for_hash(text: str) -> str:
@@ -433,6 +612,26 @@ def _normalize_for_hash(text: str) -> str:
 
 def _compute_content_hash(text: str) -> str:
     return hashlib.sha256(_normalize_for_hash(text).encode()).hexdigest()
+
+
+def _normalize_salvaged_fragment(text: str) -> str:
+    normalized = (text or '').strip()
+    normalized = re.sub(r'^(From|Sent|To|Cc|Subject):.*$', '', normalized, flags=re.MULTILINE)
+    normalized = _strip_signatures(normalized)
+    normalized = _strip_disclaimers(normalized)
+    normalized = re.sub(r'\n{3,}', '\n\n', normalized)
+    return normalized.strip()
+
+
+def _is_useful_salvaged_fragment(text: str) -> bool:
+    normalized = _normalize_salvaged_fragment(text)
+    if not normalized:
+        return False
+    if len(normalized) < 40:
+        return False
+    if len(normalized.split()) < 7:
+        return False
+    return True
 
 
 def _extract_text_from_html(html_text: str) -> str:
@@ -490,17 +689,17 @@ _OUTLOOK_QUOTE_PATTERNS = [
         r'(?:Cc:[^\n]+\n)?'
         r'Subject:[^\n]+\n'
         r'\n'
-        r'.+?)(?=\n{2}From:[^\n]+\n|$)',
+        r'.+?)(?=\n{2}From:[^\n]+\n|\Z)',
         re.MULTILINE | re.DOTALL
     ),
     re.compile(
         r'(?:^|\n\n)(----- ?Original Message ?-----\n'
-        r'.+)',
+        r'.+?)(?=\n{2}----- ?Original Message ?-----\n|\Z)',
         re.MULTILINE | re.DOTALL
     ),
     re.compile(
         r'(?:^|\n\n)(On\s[^\n]+?wrote:\n'
-        r'.+)',
+        r'.+?)(?=\n{2}On\s[^\n]+?wrote:\n|\Z)',
         re.MULTILINE | re.DOTALL
     ),
 ]
@@ -576,6 +775,7 @@ def _is_duplicate_by_similarity(conn: sqlite3.Connection, fragment_text: str, th
 
 def _make_salvaged_record(content: str, content_hash: str, parent_record: dict) -> dict:
     """Create a salvaged quoted_reply record."""
+    body_main_text = _derive_body_main_text(content, content)
     return {
         'id': str(uuid.uuid4()),
         'message_id': f"salvaged-{uuid.uuid4()}@emailindex.local",
@@ -593,6 +793,7 @@ def _make_salvaged_record(content: str, content_hash: str, parent_record: dict) 
         'body_markdown': content,
         'body_plain': content,
         'body_text': content,
+        'body_main_text': body_main_text,
         'x_mailer': None,
         'has_attachments': 0,
         'attachments': '[]',
@@ -607,6 +808,11 @@ def _make_salvaged_record(content: str, content_hash: str, parent_record: dict) 
 # Quote salvaging is handled here inline during ingestion.
 def salvage_quotes(plain_text: Optional[str] = None, html_text: Optional[str] = None, parent_record: Optional[dict] = None, conn: Optional[sqlite3.Connection] = None) -> list[dict]:
     """Extract quoted fragments from plain text or HTML, deduplicate (Tier 1 + Tier 2), return salvaged records."""
+    if parent_record is None or conn is None:
+        return []
+    parent = parent_record
+    db_conn = conn
+
     # Prefer plain text if available
     text_to_process = None
     if plain_text and plain_text.strip():
@@ -618,6 +824,7 @@ def salvage_quotes(plain_text: Optional[str] = None, html_text: Optional[str] = 
         return []
     
     salvaged = []
+    seen_hashes = set()
     
     quoted_fragments = []
     try:
@@ -629,27 +836,37 @@ def salvage_quotes(plain_text: Optional[str] = None, html_text: Optional[str] = 
     if not quoted_fragments:
         outlook_quotes = _extract_outlook_quotes(text_to_process)
         for content in outlook_quotes:
+            if not _is_useful_salvaged_fragment(content):
+                continue
             content_hash = _compute_content_hash(content)
-            if _is_duplicate_by_hash(conn, content_hash):
+            if content_hash in seen_hashes:
                 continue
-            if _is_duplicate_by_similarity(conn, content, parent_record.get('thread_id')):
+            seen_hashes.add(content_hash)
+            if _is_duplicate_by_hash(db_conn, content_hash):
                 continue
-            salvaged.append(_make_salvaged_record(content, content_hash, parent_record))
+            if _is_duplicate_by_similarity(db_conn, content, parent.get('thread_id')):
+                continue
+            salvaged.append(_make_salvaged_record(content, content_hash, parent))
     
     for fragment in quoted_fragments:
         content = fragment.content.strip()
         if len(content) < 100:
             continue
+        if not _is_useful_salvaged_fragment(content):
+            continue
         
         content_hash = _compute_content_hash(content)
+        if content_hash in seen_hashes:
+            continue
+        seen_hashes.add(content_hash)
         
-        if _is_duplicate_by_hash(conn, content_hash):
+        if _is_duplicate_by_hash(db_conn, content_hash):
             continue
         
-        if _is_duplicate_by_similarity(conn, content, parent_record.get('thread_id')):
+        if _is_duplicate_by_similarity(db_conn, content, parent.get('thread_id')):
             continue
         
-        salvaged.append(_make_salvaged_record(content, content_hash, parent_record))
+        salvaged.append(_make_salvaged_record(content, content_hash, parent))
     
     return salvaged
 
@@ -686,6 +903,7 @@ def init_database(db_path: Path):
             body_markdown TEXT NOT NULL,
             body_plain TEXT,
             body_text TEXT,
+            body_main_text TEXT,
             x_mailer TEXT,
             has_attachments INTEGER NOT NULL DEFAULT 0,
             attachments TEXT,
@@ -702,6 +920,11 @@ def init_database(db_path: Path):
             is_outbound INTEGER
         )
     """)
+
+    cursor.execute("PRAGMA table_info(emails)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "body_main_text" not in columns:
+        cursor.execute("ALTER TABLE emails ADD COLUMN body_main_text TEXT")
     
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_emails_timestamp ON emails(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_emails_thread_id ON emails(thread_id)")
@@ -870,7 +1093,9 @@ def process_attachments(message: Message, email_id: str, thread_id: Optional[str
         try:
             filename = part.get_filename()
             if not filename:
-                filename = part.get_param('filename', '', 'content-disposition')
+                filename = part.get_param('filename', '', 'content-disposition') or ''
+            if isinstance(filename, tuple):
+                filename = filename[0] or ''
             
             if not filename:
                 ext = mimetypes.guess_extension(part.get_content_type() or '.bin')
@@ -1016,6 +1241,10 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
             parent_record['body_text'] = plain_body.strip()
         else:
             parent_record['body_text'] = body_markdown.strip()
+        parent_record['body_main_text'] = _derive_body_main_text(
+            body_text=parent_record.get('body_text', ''),
+            body_markdown=parent_record.get('body_markdown', ''),
+        )
         
         tags = classify_email(parent_record)
         parent_record['category_tags'] = json.dumps(tags)
@@ -1042,7 +1271,8 @@ def parse_email_file(eml_path: Path, folder: str = "INBOX", db_conn: Optional[sq
 
 def generate_embedding_text(record: dict) -> str:
     date_part = record['timestamp'][:10] if record['timestamp'] else ""
-    body = record['body_markdown'][:1500] if record['body_markdown'] else ""
+    body_source = record.get('body_main_text') or record.get('body_text') or record.get('body_markdown') or ""
+    body = body_source[:1500]
     
     return f"Subject: {record['subject']} | From: {record['from_name'] or ''} <{record['from_address']}> | Date: {date_part} | Body: {body}"
 
@@ -1137,11 +1367,11 @@ def insert_email(conn: sqlite3.Connection, record: dict):
         INSERT INTO emails (
             id, message_id, thread_id, subject_thread_key, timestamp,
             from_address, from_name, to_addresses, cc_addresses,
-            subject, body_markdown, body_plain, body_text, x_mailer,
+            subject, body_markdown, body_plain, body_text, body_main_text, x_mailer,
             has_attachments, attachments, folder, raw_eml, embedding,
             source, parent_id, content_hash, is_outbound,
             category_tags, sender, recipients, project_tags
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         record['id'],
         record['message_id'],
@@ -1156,6 +1386,7 @@ def insert_email(conn: sqlite3.Connection, record: dict):
         record['body_markdown'],
         record['body_plain'],
         record.get('body_text', ''),
+        record.get('body_main_text', record.get('body_text', '')),
         record['x_mailer'],
         record['has_attachments'],
         record['attachments'],

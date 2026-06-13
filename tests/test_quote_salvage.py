@@ -22,6 +22,7 @@ from ingest import (
     _compute_content_hash,
     _is_duplicate_by_hash,
     _is_duplicate_by_similarity,
+    _normalize_salvaged_fragment,
     init_database,
     get_db_connection,
     _encode_text_to_embedding,
@@ -440,3 +441,61 @@ class TestHTMLOnlyEmailSalvage:
             assert records[0]['source'] == 'quoted_reply'
             assert 'From:' in records[0]['body_markdown'] or 'Sent:' in records[0]['body_markdown']
             conn.close()
+
+
+class TestSalvageQualityGuards:
+    def test_salvage_quotes_rejects_header_only_fragment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+
+            parent = SAMPLE_PARENT.copy()
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+            parent['body_plain'] = """Reply.\n\nFrom: Bob <bob@example.com>\nSent: Monday\nTo: Alice\nSubject: Test"""
+
+            records = salvage_quotes(
+                plain_text=parent['body_plain'],
+                html_text=None,
+                parent_record=parent,
+                conn=conn,
+            )
+
+            assert records == []
+            conn.close()
+
+    def test_salvage_quotes_deduplicates_repeated_fragment_within_parent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+
+            repeated = """From: Bob <bob@example.com>\nSent: Monday\nTo: Alice\nSubject: Test\n\nThis is the quoted content that should be salvaged and it contains enough words to count as useful."""
+            plain_text = f"Reply.\n\n{repeated}\n\n{repeated}"
+            parent = SAMPLE_PARENT.copy()
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+
+            records = salvage_quotes(plain_text=plain_text, html_text=None, parent_record=parent, conn=conn)
+
+            assert len(records) == 1
+            conn.close()
+
+    def test_salvage_quotes_keeps_useful_fragment_when_parent_body_is_corrupted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = _setup_test_db(db_path)
+
+            content = """From: Bob <bob@example.com>\nSent: Monday\nTo: Alice\nSubject: Test\n\nThe original parent body is messy, but this quoted fragment still carries enough useful information to preserve for retrieval quality checks."""
+            parent = SAMPLE_PARENT.copy()
+            parent['to_addresses'] = json.dumps(['bob@example.com'])
+
+            records = salvage_quotes(plain_text=f"Reply.\n\n{content}", html_text=None, parent_record=parent, conn=conn)
+
+            assert len(records) == 1
+            assert _normalize_salvaged_fragment(records[0]['body_markdown']).startswith("The original parent body")
+            conn.close()
+
+    def test_parent_body_text_is_not_destructively_rewritten_by_salvage(self):
+        original = "Reply text that should remain unchanged."
+        parent = SAMPLE_PARENT.copy()
+        parent['body_text'] = original
+
+        assert parent['body_text'] == original
