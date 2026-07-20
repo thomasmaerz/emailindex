@@ -129,11 +129,11 @@ graph TB
 
 ## Getting Started
 
-### 1. Installation (Conda Recommended)
+### 1. Installation
 
 ```bash
-conda create -n emailindex python=3.12 -y
-conda activate emailindex
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -235,7 +235,7 @@ python3 salvage_quotes.py
     "emailindex": {
       "type": "local",
       "command": [
-        "/path/to/miniconda3/envs/emailindex/bin/python3",
+        "/path/to/emailindex/.venv/bin/python3",
         "/path/to/emailindex/run-mcp-server.py"
       ],
       "enabled": true
@@ -250,7 +250,7 @@ python3 salvage_quotes.py
 {
   "mcpServers": {
     "emailindex": {
-      "command": ["/path/to/miniconda3/envs/emailindex/bin/python3", "/path/to/emailindex/run-mcp-server.py"],
+      "command": ["/path/to/emailindex/.venv/bin/python3", "/path/to/emailindex/run-mcp-server.py"],
       "env": {
         "PYTHONPATH": "/path/to/emailindex"
       }
@@ -783,8 +783,6 @@ python3 ingest.py /path/to/maildir --backfill
 **Symptom:** `ModuleNotFoundError: No module named 'sqlite_vec'`
 
 ```bash
-conda install -c conda-forge sqlite-vec
-# or
 pip install sqlite-vec
 ```
 

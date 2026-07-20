@@ -1,4 +1,4 @@
-#!/usr/bin/env /Users/thomasmaerz/miniconda3/envs/emailindex/bin/python3
+#!/usr/bin/env python3
 import sys
 import os
 import time
@@ -12,9 +12,10 @@ with open('/tmp/mcp_start.log', 'a') as f:
     f.write(f'PYTHON: {sys.executable}\n')
     f.flush()
 
-os.environ['PYTHONPATH'] = '/Users/thomasmaerz/emailindex'
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+os.environ['PYTHONPATH'] = _SCRIPT_DIR
 sys.argv.append('--stdio')
-sys.path.insert(0, '/Users/thomasmaerz/emailindex')
+sys.path.insert(0, _SCRIPT_DIR)
 
 with open('/tmp/mcp_start.log', 'a') as f:
     f.write(f'ABOUT TO IMPORT at {time.time()}\n')

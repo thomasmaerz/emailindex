@@ -1,5 +1,6 @@
 #!/bin/bash
-# Wrapper script to run MCP server - avoids conda init overhead
-export PYTHONPATH="/Users/thomasmaerz/emailindex"
+# Wrapper script to run MCP server
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PYTHONPATH="$SCRIPT_DIR"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
-exec /Users/thomasmaerz/miniconda3/envs/emailindex/bin/python3 -m mcp_server.server --stdio
+exec "$SCRIPT_DIR/.venv/bin/python3" -m mcp_server.server --stdio
