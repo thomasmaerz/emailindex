@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "emailindex": {
+      "type": "local",
+      "command": [".venv/bin/python3", "run-mcp-server.py"],
+      "cwd": "/Users/tmaerz/projects/emailindex",
+      "enabled": true
+    }
+  }
+}

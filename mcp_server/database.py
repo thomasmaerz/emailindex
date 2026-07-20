@@ -541,11 +541,13 @@ def query_email_database(
     where_clauses = []
     params = []
     fts_query = None
+    fts_clause_index = None  # position of FTS MATCH placeholder in where_clauses
 
     # Build WHERE clauses
     if exact_keywords:
         safe_query = exact_keywords.strip()
         if safe_query:
+            fts_clause_index = len(where_clauses)
             where_clauses.append("emails_fts MATCH ?")
             fts_query = safe_query
 
@@ -687,7 +689,143 @@ def query_email_database(
             response["next_cursor"] = None
             response["has_more"] = False
         return response
-    
+
+    # Hybrid search: Reciprocal Rank Fusion (RRF) combining FTS5 keyword and
+    # vector/semantic results when BOTH exact_keywords and semantic_query are
+    # supplied. Both queries are run independently against the common non-keyword
+    # WHERE filter, then their rankings are fused.
+    if fts_query and semantic_query:
+        try:
+            query_embedding = _encode_text_to_embedding(semantic_query)
+        except Exception as e:
+            close_connection()
+            return {"error": f"Failed to encode semantic query: {e}", "results": []}
+
+        # Common non-keyword WHERE (exclude FTS MATCH clause for both sides;
+        # the keyword side will add its own MATCH against emails_fts)
+        common_where_clauses = [c for i, c in enumerate(where_clauses) if i != fts_clause_index]
+        common_params = list(params)
+        common_where_sql = " AND ".join(common_where_clauses) if common_where_clauses else "1=1"
+
+        # Pool size for each retriever. Fetch more for fusion, then trim to limit.
+        pool_size = max(limit, 50)
+        rrf_k = 60  # standard smoothing constant
+        w_vec = 0.6
+        w_fts = 0.4
+
+        select_main_text = f"{_main_text_select_expr(has_main_text)} as body_main_text"
+
+        # Vector side: brute-force cosine distance (consistent with existing path)
+        vec_sql = f"""
+            SELECT e.id, e.thread_id, e.subject, e.timestamp,
+                   e.from_address as from_address, e.from_name,
+                   e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                   COALESCE(e.body_text, e.body_markdown) as body_text,
+                   {select_main_text},
+                   vec_distance_cosine(ev.embedding, ?) as vec_distance
+            FROM emails e
+            JOIN email_vectors ev ON e.id = ev.email_id
+            WHERE {common_where_sql}
+            ORDER BY vec_distance ASC
+            LIMIT ?
+        """
+        cursor_conn.execute(vec_sql, [query_embedding] + common_params + [pool_size])
+        vec_rows = cursor_conn.fetchall()
+        vec_rank_by_id = {}
+        vec_row_dict = {}
+        for rank_idx, row in enumerate(vec_rows):
+            rd = dict(row)
+            eid = rd["id"]
+            if eid not in vec_rank_by_id:  # keep first (lowest distance)
+                vec_rank_by_id[eid] = rank_idx
+                vec_row_dict[eid] = rd
+
+        # Keyword side: FTS5 match with bm25 rank
+        fts_sql = f"""
+            SELECT e.id, e.thread_id, e.subject, e.timestamp,
+                   e.from_address as from_address, e.from_name,
+                   e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                   COALESCE(e.body_text, e.body_markdown) as body_text,
+                   {select_main_text},
+                   bm25(emails_fts) as fts_rank
+            FROM emails e
+            JOIN emails_fts ON e.rowid = emails_fts.rowid
+            WHERE emails_fts MATCH ? AND ({common_where_sql})
+            ORDER BY fts_rank ASC
+            LIMIT ?
+        """
+        cursor_conn.execute(fts_sql, [fts_query] + common_params + [pool_size])
+        fts_rows = cursor_conn.fetchall()
+        fts_rank_by_id = {}
+        fts_row_dict = {}
+        for rank_idx, row in enumerate(fts_rows):
+            rd = dict(row)
+            eid = rd["id"]
+            if eid not in fts_rank_by_id:  # keep first (lowest bm25)
+                fts_rank_by_id[eid] = rank_idx
+                fts_row_dict[eid] = rd
+
+        # RRF: collect union of all email_ids from both sides, compute fused score
+        all_ids = set(vec_rank_by_id) | set(fts_rank_by_id)
+        fused = []
+        for eid in all_ids:
+            v_rank = vec_rank_by_id.get(eid)
+            f_rank = fts_rank_by_id.get(eid)
+            score = 0.0
+            if v_rank is not None:
+                score += w_vec / (rrf_k + v_rank + 1)
+            if f_rank is not None:
+                score += w_fts / (rrf_k + f_rank + 1)
+            fused.append((eid, score, v_rank, f_rank))
+
+        fused.sort(key=lambda x: x[1], reverse=True)
+        top = fused[:limit]
+
+        output = []
+        for eid, score, v_rank, f_rank in top:
+            # Prefer FTS row for snippet; fall back to vector row if email not in FTS results
+            rd = fts_row_dict.get(eid) or vec_row_dict.get(eid)
+            if rd is None:
+                continue
+            body_text = rd.get("body_text", "")
+            body_main_text = rd.get("body_main_text") or body_text
+            item = {
+                "id": rd["id"],
+                "thread_id": rd.get("thread_id"),
+                "timestamp": rd["timestamp"],
+                "from_address": rd["from_address"],
+                "from_name": rd.get("from_name"),
+                "subject": rd["subject"],
+                "is_outbound": bool(rd.get("is_outbound", 0)),
+                "has_attachments": bool(rd.get("has_attachments", 0)),
+                "source": rd.get("source", "original"),
+                "category_tags": json.loads(rd["category_tags"]) if rd.get("category_tags") else [],
+                "project_tags": json.loads(rd["project_tags"]) if rd.get("project_tags") else [],
+                "relevance_score": round(score, 6),
+                "fts_rank": f_rank,
+                "vec_rank": v_rank,
+                "retrieval_method": "both" if (f_rank is not None and v_rank is not None)
+                    else ("fts" if f_rank is not None else "vector"),
+            }
+            if use_snippet:
+                item["snippet"] = body_main_text[:300] if body_main_text else ""
+            output.append(item)
+
+        close_connection()
+        response = {"results": output}
+        if output:
+            last = output[-1]
+            if "timestamp" in last and "id" in last:
+                response["next_cursor"] = _encode_cursor(last["timestamp"], last["id"])
+                response["has_more"] = len(output) == limit
+            else:
+                response["next_cursor"] = None
+                response["has_more"] = False
+        else:
+            response["next_cursor"] = None
+            response["has_more"] = False
+        return response
+
     if sort_by == "timestamp":
         order = "ASC" if sort_order == "asc" else "DESC"
         order_clause = f"ORDER BY e.timestamp {order}"

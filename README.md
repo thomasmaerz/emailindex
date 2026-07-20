@@ -267,33 +267,41 @@ The server exposes **9 tools** for AI assistants:
 
 ### `query_email_database`
 
-Unified email search with multiple strategies:
+Unified email search with three modes: keyword-only (FTS5), semantic-only (vector), or **hybrid** (both combined via Reciprocal Rank Fusion).
 
 ```mermaid
-flowchart LR
-    A[query_email_database] --> B{semantic_query?}
-    B -->|yes| C[Generate embedding from query text]
-    C --> D[vec_distance_cosine ORDER BY score ASC]
-    D --> E[Return ranked results]
+flowchart TD
+    A[query_email_database] --> B{semantic_query AND exact_keywords?}
+    B -->|yes| C[Hybrid Search]
+    C --> C1[FTS5 keyword search<br>top 50]
+    C --> C2[Vector semantic search<br>top 50]
+    C1 --> C3[Reciprocal Rank Fusion]
+    C2 --> C3
+    C3 --> C4[Return ranked results<br>with fts_rank, vec_rank, retrieval_method]
 
-    B -->|no| F{exact_keywords?}
-    F -->|yes| G[FTS5 MATCH query]
-    G --> E
+    B -->|no| D{semantic_query only?}
+    D -->|yes| E[Generate embedding from query text]
+    E --> F[vec_distance_cosine ORDER BY score ASC]
+    F --> G[Return ranked results]
 
-    F -->|no| H{category or project filter?}
-    H -->|yes| I[Tag-based LIKE filter]
-    I --> E
+    D -->|no| H{exact_keywords?}
+    H -->|yes| I[FTS5 MATCH query]
+    I --> G
 
-    H -->|no| J[Metadata filters date, sender, etc.]
-    J --> E
+    H -->|no| J{category or project filter?}
+    J -->|yes| K[Tag-based LIKE filter]
+    K --> G
+
+    J -->|no| L[Metadata filters date, sender, etc.]
+    L --> G
 ```
 
 **Parameters:**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `semantic_query` | string | Vector search text — generates embedding at query time |
-| `exact_keywords` | string | FTS5 exact keyword match |
+| `semantic_query` | string | Vector search text — generates embedding at query time. When combined with `exact_keywords`, triggers hybrid RRF search (see [wiki](https://github.com/thomasmaerz/emailindex/wiki/Hybrid-Search-with-Reciprocal-Rank-Fusion)). |
+| `exact_keywords` | string | FTS5 exact keyword match. When combined with `semantic_query`, triggers hybrid RRF search (see [wiki](https://github.com/thomasmaerz/emailindex/wiki/Hybrid-Search-with-Reciprocal-Rank-Fusion)). |
 | `category_filter` | string | Comma-separated category tags |
 | `project_filter` | string | Comma-separated project tags |
 | `date_from` | string | Start date (ISO 8601) |
@@ -341,6 +349,14 @@ query_email_database(category_filter="work", count_only=True)
 
 # FTS5 snippets only (lighter response)
 query_email_database(exact_keywords="meeting", snippet_only=True, snippet_length=64)
+
+# Hybrid search: semantic + keyword combined via Reciprocal Rank Fusion
+query_email_database(
+    semantic_query="confused no idea what is going on",
+    exact_keywords="confused",
+    limit=10
+)
+# Results include fts_rank, vec_rank, and retrieval_method ("both", "fts", or "vector")
 ```
 
 ### `get_project_context`
@@ -541,32 +557,26 @@ This is more efficient than `get_email_by_id` when you only need the body text.
 
 ```mermaid
 flowchart TD
-    A[query_email_database] --> B{semantic_query?}
-    B -->|yes| C[Generate embedding]
-    C --> D[vec_distance_cosine ORDER BY score]
-    D --> E{cursor?}
-    B -->|no| F{exact_keywords?}
-    F -->|yes| G[FTS5 MATCH]
-    G --> E
-    F -->|no| H{category/project filter?}
-    H -->|yes| I[Tag-based LIKE filter]
-    I --> E
-    H -->|no| J[Metadata filters]
-    J --> E
-    E -->|yes| K[Keyset pagination from cursor]
-    E -->|no| L[Standard offset]
-    K --> M{count_only?}
-    L --> M
-    M -->|yes| N[Return count only]
-    M -->|no| O{fields?}
-    O -->|yes| P[Field projection]
-    O -->|no| Q[Default fields]
-    P --> R{snippet_only?}
-    Q --> R
-    R -->|yes| S[FTS5 snippet]
-    R -->|no| T[Full body_markdown]
-    S --> U[Return results with next_cursor]
-    T --> U
+    A[query_email_database] --> B{semantic_query AND<br>exact_keywords?}
+    B -->|yes| C[Hybrid RRF Search]
+    C --> C1[FTS5 top 50 + Vector top 50]
+    C1 --> C2[Reciprocal Rank Fusion]
+    C2 --> D{filter-only?}
+    B -->|no| E{semantic_query only?}
+    E -->|yes| F[Generate embedding]
+    F --> G[vec_distance_cosine ORDER BY score]
+    G --> D
+    E -->|no| H{exact_keywords?}
+    H -->|yes| I[FTS5 MATCH]
+    I --> D
+    H -->|no| J{category/project filter?}
+    J -->|yes| K[Tag-based LIKE filter]
+    K --> D
+    J -->|no| L[Metadata filters only]
+    L --> D
+    D -->|yes| M[Keyset pagination / count / fields / snippet]
+    M --> N[Return results with next_cursor]
+```
 ```
 
 ---
