@@ -28,6 +28,7 @@ from dateutil import parser as date_parser
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 import zstandard as zstd
+from embedding_device import resolve_embedding_device
 from sentence_transformers import SentenceTransformer
 from email_reply_parser import EmailReplyParser
 
@@ -684,7 +685,9 @@ _EMBEDDING_MODEL = None
 def _get_embedding_model():
     global _EMBEDDING_MODEL
     if _EMBEDDING_MODEL is None:
-        _EMBEDDING_MODEL = SentenceTransformer("BAAI/bge-small-en-v1.5")
+        _EMBEDDING_MODEL = SentenceTransformer(
+            "BAAI/bge-small-en-v1.5", device=resolve_embedding_device()
+        )
     return _EMBEDDING_MODEL
 
 
@@ -1234,8 +1237,9 @@ def generate_embedding_text(record: dict) -> str:
 
 class Embedder:
     def __init__(self):
-        logger.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
-        self.model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        device = resolve_embedding_device()
+        logger.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME} on {device}")
+        self.model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
         logger.info("Embedding model loaded")
     
     def encode_batch(self, texts: list[str]) -> list[bytes]:

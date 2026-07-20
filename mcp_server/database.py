@@ -8,6 +8,7 @@ from .config import Config
 from .models import EmailRecord, EmailSearchResult, ConversationThread, AttachmentRecord
 import zstandard as zstd
 import numpy as np
+from embedding_device import resolve_embedding_device
 
 
 # Default field set when 'fields' is not specified — body content is opt-in
@@ -118,7 +119,9 @@ def _load_embedding_model() -> None:
     global _embedding_model, _embedding_model_loading, _embedding_model_load_error
     try:
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(Config.EMBEDDING_MODEL)
+        model = SentenceTransformer(
+            Config.EMBEDDING_MODEL, device=resolve_embedding_device()
+        )
         with _embedding_model_lock:
             _embedding_model = model
             _embedding_model_load_error = None

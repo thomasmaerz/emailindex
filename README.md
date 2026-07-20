@@ -33,6 +33,8 @@ A powerful indexing and search engine for Maildir email archives. Combines tradi
 
 - **Semantic Vector Search**: True semantic similarity search using `BAAI/bge-small-en-v1.5` embeddings (384-dim) with `sqlite-vec` for efficient cosine distance ranking.
 - **Full-Text Search (FTS5)**: SQLite FTS5 with BM25 ranking for exact keyword matching.
+- **Hybrid Search (RRF)**: Combines FTS5 and semantic results with Reciprocal Rank Fusion, prioritizing emails both methods agree on while retaining literal matches and paraphrases. [Why it works](https://github.com/thomasmaerz/emailindex/wiki/Hybrid-Search-with-Reciprocal-Rank-Fusion).
+- **Apple Silicon Acceleration**: Generates embeddings on Apple Metal Performance Shaders (MPS) when available, with safe CUDA and CPU fallback.
 - **Intelligent Threading**: Reconstructs conversation threads using RFC 822 References/In-Reply-To chains with subject-based fallback for emails missing standard headers.
 - **Deduplicated Attachments**: SHA-256 based deduplication ensures that multiple copies of the same file across different emails only occupy space once.
 - **Quote Salvage**: Extracts quoted reply blocks from inline email text using EmailReplyParser + custom Outlook pattern detection, with two-tier deduplication (hash-based + semantic similarity at 0.98 threshold).

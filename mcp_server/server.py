@@ -317,12 +317,12 @@ class MCPServer:
                     "tools": [
                         {
                             "name": "query_email_database",
-                            "description": "Unified email search with FTS5 tag filtering, vector similarity, and metadata filters. Use this for keyword searches (exact_keywords), semantic similarity (semantic_query), filtering by category/project (category_filter, project_filter), date ranges (date_from, date_to), sender/recipient (from_address, to_address), and more. For contact-specific searches use get_contact_profile; for timeline analysis use get_mention_timeline; for thread-level queries use get_thread_by_id or get_thread_arc; to find threads by message count use list_threads; for project context use get_project_context; to fetch a specific email use get_email_by_id; to list available projects use list_projects.",
+                            "description": "Search emails by semantic meaning, literal keywords (FTS5), tags, dates, or participants. Pass both semantic_query and exact_keywords for recommended hybrid RRF search. Returns up to 50 ranked records with IDs, metadata, optional fields, snippets, or full threads. Use dedicated tools for timelines or profiles.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "semantic_query": {"type": "string", "description": "Vector search text"},
-                                    "exact_keywords": {"type": "string", "description": "FTS5 match"},
+                                    "semantic_query": {"type": "string", "description": "Meaning-based query. Combine with exact_keywords for recommended hybrid RRF search."},
+                                    "exact_keywords": {"type": "string", "description": "Literal FTS5 query. Combine with semantic_query for recommended hybrid RRF search."},
                                     "category_filter": {"type": "string", "description": "Comma-separated categories"},
                                     "project_filter": {"type": "string", "description": "Comma-separated projects"},
                                     "date_from": {"type": "string", "description": "Start date ISO 8601"},
@@ -346,7 +346,7 @@ class MCPServer:
                         },
                         {
                             "name": "get_project_context",
-                            "description": "Get project metadata and relevant emails from project registry",
+                            "description": "Retrieve a registered project's metadata and its latest tagged emails. Returns a project object plus up to 50 email summaries with snippets. Use after list_projects or when a project name is known; use query_email_database for ad hoc searches or filters not tied to one registered project.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -358,7 +358,7 @@ class MCPServer:
                         },
                         {
                             "name": "get_email_by_id",
-                            "description": "Fetch a specific email by its UUID. Use when you have an email ID from a search result and need the full record.",
+                            "description": "Retrieve one complete email by its UUID. Returns one full email record, including body and metadata, or no result if absent. Use after any search result when you need one message's full content; use get_thread_by_id or get_thread_arc when conversation context is needed.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -369,7 +369,7 @@ class MCPServer:
                         },
                         {
                             "name": "get_thread_by_id",
-                            "description": "Fetch all emails in a conversation thread by thread ID. Returns full conversation with metadata.",
+                            "description": "Retrieve every email in a conversation thread by thread ID. Returns one full conversation object with all message records and metadata. Use when complete thread content is needed; use get_thread_arc for a bounded summary or get_email_by_id for a single message.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -380,7 +380,7 @@ class MCPServer:
                         },
                         {
                             "name": "list_projects",
-                            "description": "List all projects in the registry. Use to discover available projects before filtering by project_filter.",
+                            "description": "List registered projects and their aliases. Returns up to 50 project summaries, including name, aliases, summary, and creation date. Use to discover project names before project_filter or get_project_context; use query_email_database when searching email content directly.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -390,7 +390,7 @@ class MCPServer:
                         },
                         {
                             "name": "get_mention_timeline",
-                            "description": "Get a timeline of mentions for a keyword, grouped by year/month/quarter",
+                            "description": "Count literal keyword mentions over time with optional sender, date, and direction filters. Returns total matches, first and last occurrence, and counts grouped by year, month, or quarter; it does not return emails. Use for trend analysis; use query_email_database to retrieve matching messages.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -406,7 +406,7 @@ class MCPServer:
                         },
                         {
                             "name": "get_contact_profile",
-                            "description": "Get a contact profile with interaction history and sample emails",
+                            "description": "Summarize correspondence with a person matched by name or email address. Returns one contact profile with known addresses, interaction dates, optional yearly timeline, and up to 50 recent sample emails. Use for person-centric context; use query_email_database for topic searches across people.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -419,7 +419,7 @@ class MCPServer:
                         },
                         {
                             "name": "get_thread_arc",
-                            "description": "Get a thread arc showing messages in a conversation thread with participant info",
+                            "description": "Summarize or inspect a conversation thread with participants and message order. Returns one thread arc with up to 50 messages, using short snippets in summary mode or bodies in full mode. Use for a bounded thread overview; use get_thread_by_id for every message in the thread.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -432,7 +432,7 @@ class MCPServer:
                         },
                         {
                             "name": "list_threads",
-                            "description": "List all conversation threads sorted by various metrics (message_count, participant_count, last_activity, first_activity)",
+                            "description": "Browse conversation threads ranked by size, participant count, or activity dates. Returns up to 50 thread summaries with counts, activity range, and latest-email metadata. Use to discover notable threads without a content query; use query_email_database for email-level search and get_thread_arc or get_thread_by_id after choosing a thread.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
