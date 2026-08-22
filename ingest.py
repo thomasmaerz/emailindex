@@ -1801,7 +1801,18 @@ def manage_embeddings(mode: str = "missing"):
     logger.info("Embedding management complete.")
 
 
+BANNER = (
+    "███████╗███╗   ███╗ █████╗ ██╗██╗     ██╗███╗   ██╗██████╗ ███████╗██╗  ██╗\n"
+    "██╔════╝████╗ ████║██╔══██╗██║██║     ██║████╗  ██║██╔══██╗██╔════╝╚██╗██╔╝\n"
+    "█████╗  ██╔████╔██║███████║██║██║     ██║██╔██╗ ██║██║  ██║█████╗   ╚███╔╝ \n"
+    "██╔══╝  ██║╚██╔╝██║██╔══██║██║██║     ██║██║╚██╗██║██║  ██║██╔══╝   ██╔██╗ \n"
+    "███████╗██║ ╚═╝ ██║██║  ██║██║███████╗██║██║ ╚████║██████╔╝███████╗██╔╝ ██╗\n"
+    "╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝╚═╝╚══════╝╚═╝╚═╝  ╚═══╝╚═════╝ ╚══════╝╚═╝  ╚═╝"
+)
+
+
 def main():
+    print(BANNER)
     parser = argparse.ArgumentParser(description="Ingest emails from Maildir or run backfill")
     parser.add_argument("maildir", nargs="?", type=Path, help="Path to Maildir directory")
     parser.add_argument("--no-resume", action="store_true", help="Start fresh, don't resume from checkpoint")
