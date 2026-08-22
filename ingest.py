@@ -33,6 +33,16 @@ from sentence_transformers import SentenceTransformer
 from email_reply_parser import EmailReplyParser
 
 from body_text_cleanup import derive_body_main_text, markdown_to_plain_text
+from mcp_server.vector_index import (
+    VECTOR_BYTES,
+    VECTOR_INDEX_DDL,
+    VECTOR_TABLE,
+    create_vector_index,
+    load_sqlite_vec,
+    replace_vector,
+    validate_vec_version,
+    validate_vector_index,
+)
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "db" / "emails.db"
@@ -972,14 +982,9 @@ def init_database(db_path: Path):
     """)
     
     try:
-        cursor.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS email_vectors USING vec0(
-                email_id TEXT,
-                embedding FLOAT[384]
-            )
-        """)
+        create_vector_index(conn)
     except Exception as e:
-        logger.warning(f"email_vectors table creation failed: {e}")
+        logger.warning(f"{VECTOR_TABLE} table creation failed: {e}")
     
     conn.commit()
     conn.close()
@@ -1364,13 +1369,17 @@ def insert_email(conn: sqlite3.Connection, record: dict):
     ))
     
     if embedding_blob:
-        try:
-            cursor.execute(
-                "INSERT INTO email_vectors (email_id, embedding) VALUES (?, ?)",
-                (record['id'], embedding_blob)
-            )
-        except Exception as e:
-            logger.warning(f"Could not insert vector: {e}")
+        replace_vector(
+            conn,
+            email_rowid=cursor.lastrowid,
+            email_id=record['id'],
+            embedding=embedding_blob,
+            source=source,
+            timestamp=record['timestamp'],
+            from_address=record['from_address'],
+            is_outbound=record.get('is_outbound', 0),
+            has_attachments=record['has_attachments'],
+        )
 
 
 def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int = 4, generate_embeddings: bool = True, embedding_batch_size: int = EMBEDDING_BATCH_SIZE):
@@ -1657,6 +1666,18 @@ def run_backfill(backfill_type: str = "all"):
             """, (owner,))
             print(f"Backfilled is_outbound for {cursor.rowcount} rows (owner: {owner})")
             updated += cursor.rowcount
+
+    if backfill_type in ("all", "is_outbound"):
+        try:
+            cursor.execute(f"""
+                UPDATE {VECTOR_TABLE}
+                SET is_outbound = COALESCE((
+                    SELECT CASE WHEN e.is_outbound THEN 1 ELSE 0 END
+                    FROM emails e WHERE e.rowid = {VECTOR_TABLE}.email_rowid
+                ), 0)
+            """)
+        except sqlite3.OperationalError:
+            pass
     
     if backfill_type in ("all", "categories"):
         cursor.execute("SELECT id, subject, body_markdown FROM emails WHERE category_tags IS NULL OR category_tags = ''")
@@ -1715,6 +1736,81 @@ def run_backfill(backfill_type: str = "all"):
     print(f"\nBackfill complete: {updated} rows updated")
 
 
+def migrate_vector_index(db_path: Path = DB_PATH) -> dict:
+    logger.info(f"Migrating vector index in {db_path}")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    try:
+        version = load_sqlite_vec(conn)
+        validate_vec_version(version)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM emails WHERE embedding IS NOT NULL AND length(embedding) != ?",
+            (VECTOR_BYTES,),
+        )
+        bad_lengths = cursor.fetchone()[0]
+        if bad_lengths:
+            raise RuntimeError(f"Found {bad_lengths} embeddings with invalid byte lengths")
+
+        cursor.execute(f"DROP TABLE IF EXISTS {VECTOR_TABLE}")
+        cursor.execute(VECTOR_INDEX_DDL)
+        cursor.execute(f"""
+            INSERT INTO {VECTOR_TABLE} (
+                email_rowid, embedding, searchable, timestamp, from_address,
+                is_outbound, has_attachments
+            )
+            SELECT rowid, embedding,
+                   CASE WHEN source = 'quoted_reply' THEN 0 ELSE 1 END,
+                   timestamp, from_address,
+                   CASE WHEN is_outbound THEN 1 ELSE 0 END,
+                   CASE WHEN has_attachments THEN 1 ELSE 0 END
+            FROM emails
+            WHERE embedding IS NOT NULL
+        """)
+        conn.commit()
+        validate_vector_index(conn)
+
+        emails_count = cursor.execute(
+            "SELECT COUNT(*) FROM emails WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+        vectors_count = cursor.execute(
+            f"SELECT COUNT(*) FROM {VECTOR_TABLE}"
+        ).fetchone()[0]
+        missing_count = cursor.execute(f"""
+            SELECT COUNT(*)
+            FROM emails e
+            LEFT JOIN {VECTOR_TABLE} v ON v.email_rowid = e.rowid
+            WHERE e.embedding IS NOT NULL AND v.email_rowid IS NULL
+        """).fetchone()[0]
+        orphan_count = cursor.execute(f"""
+            SELECT COUNT(*)
+            FROM {VECTOR_TABLE} v
+            LEFT JOIN emails e ON e.rowid = v.email_rowid
+            WHERE e.id IS NULL
+        """).fetchone()[0]
+        if emails_count != vectors_count or missing_count or orphan_count:
+            raise RuntimeError(
+                "Vector index validation failed: "
+                f"emails={emails_count}, vectors={vectors_count}, "
+                f"missing={missing_count}, orphans={orphan_count}"
+            )
+
+        result = {
+            "sqlite_vec_version": version,
+            "emails_with_embeddings": emails_count,
+            "vectors": vectors_count,
+            "missing": missing_count,
+            "orphans": orphan_count,
+        }
+        logger.info(f"Vector index migration complete: {result}")
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def manage_embeddings(mode: str = "missing", batch_size: int = EMBEDDING_BATCH_SIZE):
     """
     Generate embeddings for emails in the database.
@@ -1731,16 +1827,40 @@ def manage_embeddings(mode: str = "missing", batch_size: int = EMBEDDING_BATCH_S
             logger.info("Clearing existing embeddings...")
             cursor.execute("UPDATE emails SET embedding = NULL")
             try:
-                cursor.execute("DELETE FROM email_vectors")
+                cursor.execute(f"DELETE FROM {VECTOR_TABLE}")
             except Exception as e:
                 logger.warning(f"Could not clear email_vectors: {e}")
+            conn.commit()
+
+        if mode == "missing":
+            cursor.execute(f"""
+                SELECT e.rowid, e.id, e.embedding, e.source, e.timestamp, e.from_address,
+                       e.is_outbound, e.has_attachments
+                FROM emails e
+                LEFT JOIN {VECTOR_TABLE} v ON v.email_rowid = e.rowid
+                WHERE e.embedding IS NOT NULL AND v.email_rowid IS NULL
+            """)
+            for row in cursor.fetchall():
+                replace_vector(
+                    conn,
+                    email_rowid=row[0],
+                    email_id=row[1],
+                    embedding=row[2],
+                    source=row[3],
+                    timestamp=row[4],
+                    from_address=row[5],
+                    is_outbound=row[6],
+                    has_attachments=row[7],
+                )
             conn.commit()
         
         # Select records that need embeddings
         query = """
-            SELECT id, subject, from_name, from_address, timestamp, body_markdown 
-            FROM emails 
-            WHERE embedding IS NULL
+            SELECT e.rowid, e.id, e.subject, e.from_name, e.from_address, e.timestamp,
+                   e.body_markdown, e.body_text, e.body_main_text, e.source,
+                   e.is_outbound, e.has_attachments
+            FROM emails e
+            WHERE e.embedding IS NULL
         """
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -1760,12 +1880,18 @@ def manage_embeddings(mode: str = "missing", batch_size: int = EMBEDDING_BATCH_S
         
         for row in batch:
             record = {
-                'id': row[0],
-                'subject': row[1],
-                'from_name': row[2],
-                'from_address': row[3],
-                'timestamp': row[4],
-                'body_markdown': row[5]
+                'rowid': row[0],
+                'id': row[1],
+                'subject': row[2],
+                'from_name': row[3],
+                'from_address': row[4],
+                'timestamp': row[5],
+                'body_markdown': row[6],
+                'body_text': row[7],
+                'body_main_text': row[8],
+                'source': row[9],
+                'is_outbound': row[10],
+                'has_attachments': row[11],
             }
             batch_records.append(record)
             batch_texts.append(generate_embedding_text(record))
@@ -1777,18 +1903,17 @@ def manage_embeddings(mode: str = "missing", batch_size: int = EMBEDDING_BATCH_S
                 cursor = conn.cursor()
                 for record, emb in zip(batch_records, embeddings):
                     cursor.execute("UPDATE emails SET embedding = ? WHERE id = ?", (emb, record['id']))
-                    try:
-                        cursor.execute(
-                            "INSERT INTO email_vectors (email_id, embedding) VALUES (?, ?)",
-                            (record['id'], emb)
-                        )
-                    except Exception:
-                        # Fallback for duplicates or other vector table issues
-                        cursor.execute("DELETE FROM email_vectors WHERE email_id = ?", (record['id'],))
-                        cursor.execute(
-                            "INSERT INTO email_vectors (email_id, embedding) VALUES (?, ?)",
-                            (record['id'], emb)
-                        )
+                    replace_vector(
+                        conn,
+                        email_rowid=record['rowid'],
+                        email_id=record['id'],
+                        embedding=emb,
+                        source=record['source'],
+                        timestamp=record['timestamp'],
+                        from_address=record['from_address'],
+                        is_outbound=record['is_outbound'],
+                        has_attachments=record['has_attachments'],
+                    )
                 conn.commit()
             
             if (i + len(batch)) % 100 == 0 or (i + len(batch)) == len(rows):
@@ -1821,6 +1946,11 @@ def main():
     parser.add_argument("--backfill-embeddings", action="store_true", help="Generate missing embeddings for existing records")
     parser.add_argument("--re-embed", action="store_true", help="Clear and re-generate all embeddings")
     parser.add_argument(
+        "--migrate-vector-index",
+        action="store_true",
+        help="Build the cosine vec0 exact-KNN index from existing embeddings",
+    )
+    parser.add_argument(
         "--concurrent-limit",
         type=int,
         default=4,
@@ -1835,6 +1965,11 @@ def main():
     )
     
     args = parser.parse_args()
+
+    if args.migrate_vector_index:
+        result = migrate_vector_index()
+        print(json.dumps(result, indent=2))
+        return
     
     if args.backfill_embeddings:
         manage_embeddings(mode="missing", batch_size=args.embedding_batch_size)

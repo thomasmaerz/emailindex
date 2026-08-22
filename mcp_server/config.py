@@ -7,6 +7,7 @@ class Config:
     ATTACHMENTS_DIR = BASE_DIR / "attachments"
     
     EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+    MCP_EMBEDDING_DEVICE = "cpu"
     EMBEDDING_DIMENSIONS = 384
     EMBEDDING_MAX_LENGTH = 512
     EMBEDDING_BODY_TRUNCATE = 1500

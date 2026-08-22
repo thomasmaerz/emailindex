@@ -22,7 +22,9 @@ from ingest import (
     DB_PATH,
     CHECKPOINT_PATH,
     LOG_DIR,
+    migrate_vector_index,
 )
+from mcp_server.vector_index import VECTOR_TABLE, validate_vector_index
 
 class TestWALMode(unittest.TestCase):
     """Test that WAL mode is enabled on database initialization."""
@@ -63,6 +65,80 @@ class TestDBConnectionContextManager(unittest.TestCase):
         with get_db_connection_ctx(self.temp_db) as conn1:
             with get_db_connection_ctx(self.temp_db) as conn2:
                 self.assertIsNot(conn1, conn2)
+
+
+class TestVectorIndex(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_db = Path(self.temp_dir) / "test.db"
+        init_database(self.temp_db)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_new_database_has_cosine_vector_schema(self):
+        with get_db_connection_ctx(self.temp_db) as conn:
+            validate_vector_index(conn)
+
+    def test_insert_email_writes_searchable_vector_metadata(self):
+        embedding = b"\0" * (384 * 4)
+        record = {
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "message_id": "<vector@example.com>",
+            "thread_id": "thread-vector",
+            "subject_thread_key": "vector",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "from_address": "sender@example.com",
+            "from_name": "Sender",
+            "to_addresses": "[]",
+            "cc_addresses": None,
+            "subject": "Vector",
+            "body_markdown": "Body",
+            "body_plain": "Body",
+            "body_text": "Body",
+            "body_main_text": "Body",
+            "x_mailer": None,
+            "has_attachments": 0,
+            "attachments": "[]",
+            "folder": "INBOX",
+            "raw_eml": None,
+            "embedding": embedding,
+            "source": "original",
+            "parent_id": None,
+            "content_hash": "hash",
+            "is_outbound": 1,
+            "category_tags": "[]",
+            "sender": "sender@example.com",
+            "recipients": "[]",
+            "project_tags": "[]",
+        }
+        with get_db_connection_ctx(self.temp_db) as conn:
+            insert_email(conn, record)
+            conn.commit()
+            row = conn.execute(
+                f"SELECT searchable, timestamp, from_address, is_outbound, has_attachments FROM {VECTOR_TABLE}"
+            ).fetchone()
+
+        self.assertEqual(row, (1, record["timestamp"], record["from_address"], 1, 0))
+
+    def test_migration_copies_existing_embeddings(self):
+        embedding = b"\0" * (384 * 4)
+        with get_db_connection_ctx(self.temp_db) as conn:
+            conn.execute(
+                """
+                INSERT INTO emails (
+                    id, message_id, timestamp, from_address, to_addresses, subject,
+                    body_markdown, folder, embedding, source, has_attachments
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("id-1", "<id-1>", "2024-01-01", "a@example.com", "[]", "S", "B", "INBOX", embedding, "original", 0),
+            )
+            conn.execute(f"DELETE FROM {VECTOR_TABLE}")
+            conn.commit()
+
+        result = migrate_vector_index(self.temp_db)
+        self.assertEqual(result["vectors"], 1)
+        self.assertEqual(result["missing"], 0)
 
 
 class TestConcurrentLimitCLI(unittest.TestCase):

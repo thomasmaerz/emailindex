@@ -1,4 +1,4 @@
-import sys, tempfile, sqlite3, os
+import sys, tempfile, sqlite3, os, struct
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +11,7 @@ from mcp_server.database import (
     initialize_embedding_model_async,
 )
 from mcp_server.config import Config
+from mcp_server.vector_index import VECTOR_TABLE
 
 
 def create_fake_db_connection():
@@ -101,15 +102,33 @@ def create_test_db():
         """, (uid, f"<{eid}@example.com>", ts, sender, name, recip, subj, body, body, body, "INBOX", sender2, recip, category_tags, project_tags, 0, subj.lower()))
         cursor.execute("INSERT INTO emails_fts(rowid, subject, body_markdown) VALUES (last_insert_rowid(), ?, ?)", (subj, body))
 
-    cursor.execute("""
-        CREATE TABLE email_vectors (
-            email_id TEXT PRIMARY KEY,
-            embedding BLOB
+    conn.enable_load_extension(True)
+    import sqlite_vec
+    sqlite_vec.load(conn)
+    cursor.execute(f"""
+        CREATE VIRTUAL TABLE {VECTOR_TABLE} USING vec0(
+            email_rowid INTEGER PRIMARY KEY,
+            embedding FLOAT[384] distance_metric=cosine,
+            searchable BOOLEAN,
+            timestamp TEXT,
+            from_address TEXT,
+            is_outbound BOOLEAN,
+            has_attachments BOOLEAN
         )
     """)
-    for eid in ["001", "002", "003", "004", "005"]:
+    for index, eid in enumerate(["001", "002", "003", "004", "005"]):
         uid = f"550e8400-0000-0000-0000-000000000{eid}"
-        cursor.execute("INSERT INTO email_vectors(email_id, embedding) VALUES (?, ?)", (uid, b"fake-vector"))
+        email_row = cursor.execute(
+            "SELECT rowid, timestamp, from_address, is_outbound, has_attachments FROM emails WHERE id = ?",
+            (uid,),
+        ).fetchone()
+        values = [0.0] * 384
+        values[index] = 1.0
+        embedding = struct.pack("384f", *values)
+        cursor.execute(
+            f"INSERT INTO {VECTOR_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (email_row[0], embedding, 1, email_row[1], email_row[2], email_row[3], email_row[4]),
+        )
 
     conn.commit()
     conn.close()
@@ -463,8 +482,9 @@ def test_semantic_query_with_date_filter_applies_shared_where_clause():
     assert result["results"] == [], f"Expected empty semantic result set from fake cursor, got {result}"
     assert len(fake_cursor.calls) == 1, f"Expected exactly one semantic query execution, got {fake_cursor.calls}"
     sql, params = fake_cursor.calls[0]
-    assert "e.timestamp >= ?" in sql, f"Expected date filter in semantic SQL, got {sql}"
-    assert params == [b"fake-embedding", "2030-01-01", 10], (
+    assert "timestamp >= ?" in sql, f"Expected date filter in semantic SQL, got {sql}"
+    assert "embedding MATCH ?" in sql
+    assert params == [b"fake-embedding", 10, "2030-01-01"], (
         f"Expected semantic params to include date filter placeholder, got {params}"
     )
 
@@ -484,8 +504,9 @@ def test_semantic_query_with_is_outbound_filter_applies_shared_where_clause():
     assert result["results"] == [], f"Expected empty semantic result set from fake cursor, got {result}"
     assert len(fake_cursor.calls) == 1, f"Expected exactly one semantic query execution, got {fake_cursor.calls}"
     sql, params = fake_cursor.calls[0]
-    assert "e.is_outbound = ?" in sql, f"Expected outbound filter in semantic SQL, got {sql}"
-    assert params == [b"fake-embedding", 1, 5], (
+    assert "is_outbound = ?" in sql, f"Expected outbound filter in semantic SQL, got {sql}"
+    assert "embedding MATCH ?" in sql
+    assert params == [b"fake-embedding", 5, 1], (
         f"Expected semantic params to include outbound filter placeholder, got {params}"
     )
 
@@ -505,8 +526,9 @@ def test_semantic_query_with_is_outbound_false_filter_applies_shared_where_claus
     assert result["results"] == [], f"Expected empty semantic result set from fake cursor, got {result}"
     assert len(fake_cursor.calls) == 1, f"Expected exactly one semantic query execution, got {fake_cursor.calls}"
     sql, params = fake_cursor.calls[0]
-    assert "e.is_outbound = ?" in sql, f"Expected outbound filter in semantic SQL, got {sql}"
-    assert params == [b"fake-embedding", 0, 5], (
+    assert "is_outbound = ?" in sql, f"Expected outbound filter in semantic SQL, got {sql}"
+    assert "embedding MATCH ?" in sql
+    assert params == [b"fake-embedding", 5, 0], (
         f"Expected semantic params to normalize outbound false to 0, got {params}"
     )
 
@@ -596,7 +618,8 @@ def test_search_emails_similarity_order():
 
     assert len(fake_cursor.calls) == 2, f"Expected embedding lookup and search query, got {fake_cursor.calls}"
     sql, _ = fake_cursor.calls[1]
-    assert "ORDER BY score ASC" in sql, f"Expected vector similarity ordering by ascending distance, got {sql}"
+    assert "embedding MATCH ?" in sql, f"Expected vec0 MATCH search, got {sql}"
+    assert "ORDER BY knn.distance ASC" in sql, f"Expected vector similarity ordering by ascending distance, got {sql}"
     scores = [result.score for result in similar if result.score is not None]
     assert scores == sorted(scores), f"Expected most-similar-first ordering, got {scores}"
 

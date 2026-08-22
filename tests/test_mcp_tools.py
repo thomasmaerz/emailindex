@@ -347,7 +347,8 @@ def test_mcp_server_tools_list():
         
         Config.DB_PATH = Path(path)
         
-        server = MCPServer()
+        with patch.object(MCPServer, "_verify_schema"):
+            server = MCPServer()
         
         expected_tools = [
             "query_email_database",

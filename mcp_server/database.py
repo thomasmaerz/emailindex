@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Optional, List
 from .config import Config
 from .models import EmailRecord, EmailSearchResult, ConversationThread, AttachmentRecord
+from .vector_index import VECTOR_TABLE, load_sqlite_vec, validate_vec_version
 import zstandard as zstd
 import numpy as np
-from embedding_device import resolve_embedding_device
 
 
 # Default field set when 'fields' is not specified — body content is opt-in
@@ -96,6 +96,45 @@ def _main_text_select_expr_no_alias(has_main_text: bool) -> str:
     return "COALESCE(body_text, body_markdown)"
 
 
+def _vector_match_filters(
+    *,
+    date_from: Optional[str],
+    date_to: Optional[str],
+    from_address: Optional[str],
+    is_outbound: Optional[bool],
+    has_attachments: Optional[bool],
+) -> tuple[list[str], list]:
+    clauses = ["searchable = 1"]
+    params = []
+    if date_from:
+        clauses.append("timestamp >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("timestamp <= ?")
+        params.append(date_to)
+    if from_address:
+        clauses.append("from_address = ?")
+        params.append(from_address)
+    if is_outbound is not None:
+        clauses.append("is_outbound = ?")
+        params.append(1 if is_outbound else 0)
+    if has_attachments is not None:
+        clauses.append("has_attachments = ?")
+        params.append(1 if has_attachments else 0)
+    return clauses, params
+
+
+def _requires_scalar_vector_fallback(
+    *,
+    category_filter: Optional[str],
+    project_filter: Optional[str],
+    from_name: Optional[str],
+    to_address: Optional[str],
+    cursor: Optional[str],
+) -> bool:
+    return any((category_filter, project_filter, from_name, to_address, cursor))
+
+
 def _encode_cursor(timestamp: str, email_id: str) -> str:
     data = json.dumps({"ts": timestamp, "id": email_id})
     return base64.b64encode(data.encode()).decode()
@@ -120,7 +159,7 @@ def _load_embedding_model() -> None:
     try:
         from sentence_transformers import SentenceTransformer
         model = SentenceTransformer(
-            Config.EMBEDDING_MODEL, device=resolve_embedding_device()
+            Config.EMBEDDING_MODEL, device=Config.MCP_EMBEDDING_DEVICE
         )
         with _embedding_model_lock:
             _embedding_model = model
@@ -173,12 +212,8 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(str(Config.DB_PATH), timeout=Config.DB_TIMEOUT)
     conn.row_factory = sqlite3.Row
     
-    try:
-        import sqlite_vec
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-    except Exception:
-        pass
+    version = load_sqlite_vec(conn)
+    validate_vec_version(version)
     
     _thread_local.conn = conn
     return conn
@@ -266,27 +301,27 @@ def search_emails(
     where_clauses = []
     params = []
     
-    # Vector similarity search using sqlite-vec
-    # NOTE: This query performs a brute-force full-table scan over vectorized emails.
-    # sqlite-vec v0.1.8+ supports ANN indexes, but the current schema and queries
-    # in this codebase do not create or use them for this path.
-    # Latency scales linearly: ~81K emails ≈ 3-5s, ~500K emails ≈ 30s.
-    # See https://github.com/asg017/sqlite-vec for index options and future adoption.
+    # Vector similarity search using sqlite-vec exact KNN.
     if similar_to_email_id:
         cursor.execute("SELECT embedding FROM emails WHERE id = ?", (similar_to_email_id,))
         row = cursor.fetchone()
         if row and row['embedding']:
             try:
-                cursor.execute("""
+                cursor.execute(f"""
+                    WITH knn AS (
+                        SELECT email_rowid, distance
+                        FROM {VECTOR_TABLE}
+                        WHERE embedding MATCH ? AND k = ?
+                          AND searchable = 1
+                          AND email_rowid != (SELECT rowid FROM emails WHERE id = ?)
+                    )
                     SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address,
                            e.from_name, e.has_attachments, e.folder, e.body_markdown as snippet,
-                           vec_distance_cosine(e.embedding, ?) as score
-                    FROM emails e
-                    WHERE e.id != ? AND e.embedding IS NOT NULL
-                      AND (e.source IS NULL OR e.source != 'quoted_reply')
-                    ORDER BY score ASC
-                    LIMIT ?
-                """, (row['embedding'], similar_to_email_id, limit))
+                           knn.distance as score
+                    FROM knn
+                    JOIN emails e ON e.rowid = knn.email_rowid
+                    ORDER BY knn.distance ASC, e.id ASC
+                """, (row['embedding'], limit, similar_to_email_id))
                 
                 results = cursor.fetchall()
                 close_connection()
@@ -633,24 +668,51 @@ def query_email_database(
 
         select_main_text = f"{_main_text_select_expr(has_main_text)} as body_main_text"
 
-        sql = f"""
-            SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
-                   e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
-                   COALESCE(e.body_text, e.body_markdown) as body_text,
-                   {select_main_text},
-                   -- NOTE: This query performs a brute-force full-table scan over email_vectors.
-                   -- sqlite-vec v0.1.8+ supports ANN indexes, but the current schema and queries
-                   -- in this codebase do not create or use them for this path.
-                   -- Latency scales linearly: ~81K emails ≈ 3-5s, ~500K emails ≈ 30s.
-                   -- See https://github.com/asg017/sqlite-vec for index options and future adoption.
-                   vec_distance_cosine(ev.embedding, ?) as relevance_score
-            FROM emails e
-            JOIN email_vectors ev ON e.id = ev.email_id
-            WHERE {where_sql}
-            ORDER BY relevance_score ASC
-            LIMIT ?
-        """
-        semantic_params = [query_embedding] + list(params) + [limit]
+        scalar_fallback = _requires_scalar_vector_fallback(
+            category_filter=category_filter,
+            project_filter=project_filter,
+            from_name=from_name,
+            to_address=to_address,
+            cursor=cursor,
+        )
+        if scalar_fallback:
+            sql = f"""
+                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
+                       e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                       COALESCE(e.body_text, e.body_markdown) as body_text,
+                       {select_main_text},
+                       vec_distance_cosine(ev.embedding, ?) as relevance_score
+                FROM emails e
+                JOIN {VECTOR_TABLE} ev ON e.rowid = ev.email_rowid
+                WHERE {where_sql}
+                ORDER BY relevance_score ASC, e.id ASC
+                LIMIT ?
+            """
+            semantic_params = [query_embedding] + list(params) + [limit]
+        else:
+            match_clauses, match_params = _vector_match_filters(
+                date_from=date_from,
+                date_to=date_to,
+                from_address=from_address,
+                is_outbound=is_outbound,
+                has_attachments=has_attachments,
+            )
+            match_where = " AND ".join(match_clauses)
+            sql = f"""
+                WITH knn AS (
+                    SELECT email_rowid, distance
+                    FROM {VECTOR_TABLE}
+                    WHERE embedding MATCH ? AND k = ? AND {match_where}
+                )
+                SELECT e.id, e.thread_id, e.subject, e.timestamp, e.from_address as from_address,
+                       e.from_name, e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                       COALESCE(e.body_text, e.body_markdown) as body_text,
+                       {select_main_text}, knn.distance as relevance_score
+                FROM knn
+                JOIN emails e ON e.rowid = knn.email_rowid
+                ORDER BY knn.distance ASC, e.id ASC
+            """
+            semantic_params = [query_embedding, limit] + match_params
 
         cursor_conn.execute(sql, semantic_params)
         results = cursor_conn.fetchall()
@@ -718,21 +780,54 @@ def query_email_database(
 
         select_main_text = f"{_main_text_select_expr(has_main_text)} as body_main_text"
 
-        # Vector side: brute-force cosine distance (consistent with existing path)
-        vec_sql = f"""
-            SELECT e.id, e.thread_id, e.subject, e.timestamp,
-                   e.from_address as from_address, e.from_name,
-                   e.category_tags, e.project_tags, e.has_attachments, e.folder,
-                   COALESCE(e.body_text, e.body_markdown) as body_text,
-                   {select_main_text},
-                   vec_distance_cosine(ev.embedding, ?) as vec_distance
-            FROM emails e
-            JOIN email_vectors ev ON e.id = ev.email_id
-            WHERE {common_where_sql}
-            ORDER BY vec_distance ASC
-            LIMIT ?
-        """
-        cursor_conn.execute(vec_sql, [query_embedding] + common_params + [pool_size])
+        scalar_fallback = _requires_scalar_vector_fallback(
+            category_filter=category_filter,
+            project_filter=project_filter,
+            from_name=from_name,
+            to_address=to_address,
+            cursor=cursor,
+        )
+        if scalar_fallback:
+            vec_sql = f"""
+                SELECT e.id, e.thread_id, e.subject, e.timestamp,
+                       e.from_address as from_address, e.from_name,
+                       e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                       COALESCE(e.body_text, e.body_markdown) as body_text,
+                       {select_main_text},
+                       vec_distance_cosine(ev.embedding, ?) as vec_distance
+                FROM emails e
+                JOIN {VECTOR_TABLE} ev ON e.rowid = ev.email_rowid
+                WHERE {common_where_sql}
+                ORDER BY vec_distance ASC, e.id ASC
+                LIMIT ?
+            """
+            vec_params = [query_embedding] + common_params + [pool_size]
+        else:
+            match_clauses, match_params = _vector_match_filters(
+                date_from=date_from,
+                date_to=date_to,
+                from_address=from_address,
+                is_outbound=is_outbound,
+                has_attachments=has_attachments,
+            )
+            match_where = " AND ".join(match_clauses)
+            vec_sql = f"""
+                WITH knn AS (
+                    SELECT email_rowid, distance
+                    FROM {VECTOR_TABLE}
+                    WHERE embedding MATCH ? AND k = ? AND {match_where}
+                )
+                SELECT e.id, e.thread_id, e.subject, e.timestamp,
+                       e.from_address as from_address, e.from_name,
+                       e.category_tags, e.project_tags, e.has_attachments, e.folder,
+                       COALESCE(e.body_text, e.body_markdown) as body_text,
+                       {select_main_text}, knn.distance as vec_distance
+                FROM knn
+                JOIN emails e ON e.rowid = knn.email_rowid
+                ORDER BY knn.distance ASC, e.id ASC
+            """
+            vec_params = [query_embedding, pool_size] + match_params
+        cursor_conn.execute(vec_sql, vec_params)
         vec_rows = cursor_conn.fetchall()
         vec_rank_by_id = {}
         vec_row_dict = {}
@@ -781,7 +876,7 @@ def query_email_database(
                 score += w_fts / (rrf_k + f_rank + 1)
             fused.append((eid, score, v_rank, f_rank))
 
-        fused.sort(key=lambda x: x[1], reverse=True)
+        fused.sort(key=lambda x: (-x[1], x[0]))
         top = fused[:limit]
 
         output = []

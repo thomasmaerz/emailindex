@@ -1,4 +1,13 @@
-# Email Intelligence System (emailindex)
+<pre>
+███████╗███╗   ███╗ █████╗ ██╗██╗     ██╗███╗   ██╗██████╗ ███████╗██╗  ██╗
+██╔════╝████╗ ████║██╔══██╗██║██║     ██║████╗  ██║██╔══██╗██╔════╝╚██╗██╔╝
+█████╗  ██╔████╔██║███████║██║██║     ██║██╔██╗ ██║██║  ██║█████╗   ╚███╔╝
+██╔══╝  ██║╚██╔╝██║██╔══██║██║██║     ██║██║╚██╗██║██║  ██║██╔══╝   ██╔██╗
+███████╗██║ ╚═╝ ██║██║  ██║██║███████╗██║██║ ╚████║██████╔╝███████╗██╔╝ ██╗
+╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝╚═╝╚══════╝╚═╝╚═╝  ╚═══╝╚═════╝ ╚══════╝╚═╝  ╚═╝
+</pre>
+
+## Email Intelligence System
 
 ![Python 3.12+](https://img.shields.io/badge/Python-3.12+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
@@ -31,7 +40,7 @@ A powerful indexing and search engine for Maildir email archives. Combines tradi
 
 ## Features
 
-- **Semantic Vector Search**: True semantic similarity search using `BAAI/bge-small-en-v1.5` embeddings (384-dim) with `sqlite-vec` for efficient cosine distance ranking.
+- **Semantic Vector Search**: Exact cosine KNN using `BAAI/bge-small-en-v1.5` embeddings (384-dim) and sqlite-vec `vec0 MATCH` retrieval. Query embeddings run on CPU; bulk ingestion can use MPS or CUDA.
 - **Full-Text Search (FTS5)**: SQLite FTS5 with BM25 ranking for exact keyword matching.
 - **Hybrid Search (RRF)**: Combines FTS5 and semantic results with Reciprocal Rank Fusion, prioritizing emails both methods agree on while retaining literal matches and paraphrases. [Why it works](https://github.com/thomasmaerz/emailindex/wiki/Hybrid-Search-with-Reciprocal-Rank-Fusion).
 - **Apple Silicon Acceleration**: Generates embeddings on Apple Metal Performance Shaders (MPS) when available, with safe CUDA and CPU fallback.
@@ -302,7 +311,7 @@ flowchart TD
 
     B -->|no| D{semantic_query only?}
     D -->|yes| E[Generate embedding from query text]
-    E --> F[vec_distance_cosine ORDER BY score ASC]
+    E --> F[vec0 MATCH exact cosine KNN]
     F --> G[Return ranked results]
 
     D -->|no| H{exact_keywords?}

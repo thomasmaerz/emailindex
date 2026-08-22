@@ -26,6 +26,9 @@ from pathlib import Path
 from typing import Optional
 
 BASE_DIR = Path(__file__).parent.parent
+sys.path.insert(0, str(BASE_DIR))
+from mcp_server.vector_index import VECTOR_BYTES, VECTOR_TABLE, load_sqlite_vec, validate_vector_index
+
 MAILDIR = BASE_DIR / "maildir" / "cur"
 DB_PATH = BASE_DIR / "db" / "emails.db"
 EMBEDDING_DIMENSIONS = 384
@@ -58,8 +61,11 @@ def check_schema() -> tuple[bool, str, dict]:
         columns = [row[1] for row in c.fetchall()]
         result["embedding_column"] = "embedding" in columns
         
-        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='email_vectors'")
+        load_sqlite_vec(conn)
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (VECTOR_TABLE,))
         result["email_vectors_table"] = c.fetchone() is not None
+        if result["email_vectors_table"]:
+            validate_vector_index(conn)
         
         conn.close()
         
@@ -137,12 +143,13 @@ def check_vector_dimensions() -> tuple[bool, str, dict]:
 
 
 def check_vector_table_sync() -> tuple[bool, str, dict]:
-    """Check that email_vectors table has matching record count."""
+    """Check that the canonical vec0 index matches embedded emails by rowid."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
     try:
-        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='email_vectors'")
+        load_sqlite_vec(conn)
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (VECTOR_TABLE,))
         if c.fetchone() is None:
             conn.close()
             return False, "email_vectors table does not exist", {"emails_count": 0, "vectors_count": 0}
@@ -150,21 +157,39 @@ def check_vector_table_sync() -> tuple[bool, str, dict]:
         conn.close()
         return False, f"Error checking table: {e}", {"emails_count": 0, "vectors_count": 0}
     
-    c.execute("SELECT COUNT(*) FROM emails")
+    c.execute("SELECT COUNT(*) FROM emails WHERE embedding IS NOT NULL")
     emails_count = c.fetchone()[0]
     
     try:
-        c.execute("SELECT COUNT(*) FROM email_vectors")
+        c.execute(f"SELECT COUNT(*) FROM {VECTOR_TABLE}")
         vectors_count = c.fetchone()[0]
+        c.execute(f"""
+            SELECT COUNT(*) FROM emails e
+            LEFT JOIN {VECTOR_TABLE} v ON v.email_rowid = e.rowid
+            WHERE e.embedding IS NOT NULL AND v.email_rowid IS NULL
+        """)
+        missing_count = c.fetchone()[0]
+        c.execute(f"""
+            SELECT COUNT(*) FROM {VECTOR_TABLE} v
+            LEFT JOIN emails e ON e.rowid = v.email_rowid
+            WHERE e.rowid IS NULL
+        """)
+        orphan_count = c.fetchone()[0]
     except sqlite3.OperationalError:
-        c.execute("SELECT COUNT(*) FROM emails WHERE embedding IS NOT NULL")
-        vectors_count = c.fetchone()[0]
+        vectors_count = 0
+        missing_count = emails_count
+        orphan_count = 0
     
     conn.close()
     
-    result = {"emails_count": emails_count, "vectors_count": vectors_count}
+    result = {
+        "emails_count": emails_count,
+        "vectors_count": vectors_count,
+        "missing_count": missing_count,
+        "orphan_count": orphan_count,
+    }
     
-    if emails_count == vectors_count:
+    if emails_count == vectors_count and missing_count == 0 and orphan_count == 0:
         return True, f"Both tables synced: {emails_count} records", result
     else:
         return False, f"Mismatch: {emails_count} emails vs {vectors_count} vectors", result
@@ -185,13 +210,14 @@ def check_vector_search_works() -> tuple[bool, str, dict]:
         return False, f"Failed to load sqlite_vec: {e}", result
     
     try:
-        c.execute("SELECT id, embedding FROM emails WHERE embedding IS NOT NULL LIMIT 1")
+        c.execute("SELECT rowid, id, embedding FROM emails WHERE embedding IS NOT NULL LIMIT 1")
         sample = c.fetchone()
         
         if not sample:
             conn.close()
             return False, "No emails with embeddings found", result
         
+        sample_rowid = sample["rowid"]
         sample_id = sample["id"]
         sample_embedding = sample["embedding"]
         
@@ -200,13 +226,16 @@ def check_vector_search_works() -> tuple[bool, str, dict]:
         sample_results = []
         
         try:
-            c.execute("""
-                SELECT e.id, e.subject, vec_distance_cosine(e.embedding, ?) as score
-                FROM emails e
-                WHERE e.id != ? AND e.embedding IS NOT NULL
-                ORDER BY score
-                LIMIT 5
-            """, (sample_embedding, sample_id))
+            c.execute(f"""
+                WITH knn AS (
+                    SELECT email_rowid, distance
+                    FROM {VECTOR_TABLE}
+                    WHERE embedding MATCH ? AND k = 5 AND email_rowid != ?
+                )
+                SELECT e.id, e.subject, knn.distance as score
+                FROM knn JOIN emails e ON e.rowid = knn.email_rowid
+                ORDER BY knn.distance, e.id
+            """, (sample_embedding, sample_rowid))
             
             results = c.fetchall()
             tests_total = 1
@@ -300,20 +329,23 @@ def run_vector_search_tests(conn: sqlite3.Connection, sample_emails: list[dict])
     for email_sample in sample_emails:
         email_id = email_sample["id"]
         
-        c.execute("SELECT embedding FROM emails WHERE id = ?", (email_id,))
+        c.execute("SELECT rowid, embedding FROM emails WHERE id = ?", (email_id,))
         row = c.fetchone()
         
         if not row or not row["embedding"]:
             continue
         
         try:
-            c.execute("""
-                SELECT e.id, e.subject, vec_distance_cosine(e.embedding, ?) as score
-                FROM emails e
-                WHERE e.id != ? AND e.embedding IS NOT NULL
-                ORDER BY score
-                LIMIT 3
-            """, (row["embedding"], email_id))
+            c.execute(f"""
+                WITH knn AS (
+                    SELECT email_rowid, distance
+                    FROM {VECTOR_TABLE}
+                    WHERE embedding MATCH ? AND k = 3 AND email_rowid != ?
+                )
+                SELECT e.id, e.subject, knn.distance as score
+                FROM knn JOIN emails e ON e.rowid = knn.email_rowid
+                ORDER BY knn.distance, e.id
+            """, (row["embedding"], row["rowid"]))
             
             results = c.fetchall()
             

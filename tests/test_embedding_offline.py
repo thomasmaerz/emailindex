@@ -48,3 +48,27 @@ def test_run_mcp_server_sets_hf_hub_offline_before_server_import():
             os.environ.pop("HF_HUB_OFFLINE", None)
         else:
             os.environ["HF_HUB_OFFLINE"] = original_hf
+
+
+def test_mcp_embedding_model_uses_cpu():
+    import mcp_server.database as database
+
+    model = object()
+    with patch("sentence_transformers.SentenceTransformer", return_value=model) as constructor, \
+         patch.object(database, "_embedding_model", None), \
+         patch.object(database, "_embedding_model_load_error", None), \
+         patch.object(database, "_embedding_model_loading", True):
+        database._load_embedding_model()
+
+    constructor.assert_called_once_with(database.Config.EMBEDDING_MODEL, device="cpu")
+
+
+def test_ingestion_embedder_keeps_device_autodetection():
+    import ingest
+
+    with patch("ingest.resolve_embedding_device", return_value="mps") as resolver, \
+         patch("ingest.SentenceTransformer") as constructor:
+        ingest.Embedder(batch_size=8)
+
+    resolver.assert_called_once_with()
+    constructor.assert_called_once_with(ingest.EMBEDDING_MODEL_NAME, device="mps")

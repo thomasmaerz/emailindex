@@ -23,6 +23,7 @@ from .database import (
     initialize_embedding_model_async
 )
 from .config import Config
+from .vector_index import load_sqlite_vec, validate_vec_version, validate_vector_index
 
 
 class MCPServer:
@@ -60,6 +61,16 @@ class MCPServer:
                 print("Run: python migrate_body_text.py", file=sys.stderr)
             else:
                 print("Run: python migrate_v2.py", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            version = load_sqlite_vec(conn)
+            validate_vec_version(version)
+            validate_vector_index(conn)
+        except Exception as exc:
+            conn.close()
+            print(f"ERROR: Invalid vector index: {exc}", file=sys.stderr)
+            print("Run: python ingest.py --migrate-vector-index", file=sys.stderr)
             sys.exit(1)
         
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='project_registry'")
