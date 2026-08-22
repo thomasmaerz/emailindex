@@ -44,7 +44,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_DIMENSIONS = 384
-EMBEDDING_BATCH_SIZE = 8
+EMBEDDING_BATCH_SIZE = 64
 CHECKPOINT_INTERVAL = 500
 ZSTD_COMPRESSION_LEVEL = 3
 MAX_EMAILS = 999999
@@ -1236,16 +1236,17 @@ def generate_embedding_text(record: dict) -> str:
 
 
 class Embedder:
-    def __init__(self):
+    def __init__(self, batch_size: int = EMBEDDING_BATCH_SIZE):
         device = resolve_embedding_device()
         logger.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME} on {device}")
         self.model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
-        logger.info("Embedding model loaded")
+        self.batch_size = batch_size
+        logger.info(f"Embedding model loaded (batch_size={batch_size})")
     
     def encode_batch(self, texts: list[str]) -> list[bytes]:
         embeddings = self.model.encode(
             texts,
-            batch_size=EMBEDDING_BATCH_SIZE,
+            batch_size=self.batch_size,
             show_progress_bar=False,
             convert_to_numpy=True
         )
@@ -1372,7 +1373,7 @@ def insert_email(conn: sqlite3.Connection, record: dict):
             logger.warning(f"Could not insert vector: {e}")
 
 
-def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int = 4, generate_embeddings: bool = True):
+def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int = 4, generate_embeddings: bool = True, embedding_batch_size: int = EMBEDDING_BATCH_SIZE):
     init_database(DB_PATH)
     
     checkpoint = load_checkpoint()
@@ -1402,7 +1403,7 @@ def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int
     
     embedder = None
     if generate_embeddings:
-        embedder = Embedder()
+        embedder = Embedder(batch_size=embedding_batch_size)
     else:
         logger.info("Skipping embedding generation (--no-embeddings)")
     
@@ -1489,7 +1490,7 @@ def ingest_emails(maildir_path: Path, resume: bool = True, concurrent_limit: int
                         pending_texts.append(text)
                     pending_records.append(record)
                 
-                if len(pending_records) >= (EMBEDDING_BATCH_SIZE if generate_embeddings else 100):
+                if len(pending_records) >= (embedding_batch_size if generate_embeddings else 100):
                     if generate_embeddings and embedder:
                         embeddings = embedder.encode_batch(pending_texts)
                         for rec, emb in zip(pending_records, embeddings):
@@ -1714,7 +1715,7 @@ def run_backfill(backfill_type: str = "all"):
     print(f"\nBackfill complete: {updated} rows updated")
 
 
-def manage_embeddings(mode: str = "missing"):
+def manage_embeddings(mode: str = "missing", batch_size: int = EMBEDDING_BATCH_SIZE):
     """
     Generate embeddings for emails in the database.
     
@@ -1750,9 +1751,8 @@ def manage_embeddings(mode: str = "missing"):
 
     logger.info(f"Found {len(rows)} emails to embed.")
     
-    embedder = Embedder()
+    embedder = Embedder(batch_size=batch_size)
     
-    batch_size = EMBEDDING_BATCH_SIZE
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         batch_records = []
@@ -1826,15 +1826,22 @@ def main():
         default=4,
         help="Number of parallel workers for ingestion (default: 4)"
     )
+    parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=EMBEDDING_BATCH_SIZE,
+        help="Embedding encode batch size (default: 64). Bigger = faster: MPS 8->488/s, 64->2004/s. "
+             "Lower (e.g. 8) on low-RAM CPU-only hosts: batch 4096 on CPU uses ~4GB RAM."
+    )
     
     args = parser.parse_args()
     
     if args.backfill_embeddings:
-        manage_embeddings(mode="missing")
+        manage_embeddings(mode="missing", batch_size=args.embedding_batch_size)
         return
         
     if args.re_embed:
-        manage_embeddings(mode="all")
+        manage_embeddings(mode="all", batch_size=args.embedding_batch_size)
         return
 
     if args.backfill:
@@ -1859,7 +1866,8 @@ def main():
         args.maildir, 
         resume=not args.no_resume, 
         concurrent_limit=args.concurrent_limit,
-        generate_embeddings=not args.no_embeddings
+        generate_embeddings=not args.no_embeddings,
+        embedding_batch_size=args.embedding_batch_size
     )
 
 

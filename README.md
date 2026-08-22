@@ -169,6 +169,25 @@ This will:
 - Thread-safe checkpoint tracking with `threading.Lock`
 - Duplicate detection before embedding work (saves computation)
 
+**Embedding Batch Size** (`--embedding-batch-size`, default: 64):
+
+Bigger batches = faster encoding. Measured throughput on this host:
+
+| Batch size | MPS | CPU |
+|-----------|-----|-----|
+| 8 | ~488 texts/s | ~228 texts/s |
+| 32 | ~1434 texts/s | ~413 texts/s |
+| 64 | ~2004 texts/s | ~522 texts/s |
+
+- **Default 64** is a good balance on any setup — near-peak MPS throughput with modest RAM (~550MB).
+- **On low-RAM CPU-only hosts** (e.g. an 8GB Linux box with no GPU), lower it to 8–32. CPU batch 4096 alone consumes ~4GB RAM.
+- Memory is bounded per batch — ingestion is streaming and never holds all emails in RAM at once, regardless of total archive size.
+
+```bash
+# Low-RAM CPU-only host
+python3 ingest.py /path/to/maildir --embedding-batch-size 16
+```
+
 ### 3. AI Classification (Optional)
 
 ```bash
