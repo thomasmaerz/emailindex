@@ -1960,7 +1960,7 @@ def main():
         "--embedding-batch-size",
         type=int,
         default=EMBEDDING_BATCH_SIZE,
-        help="Embedding encode batch size (default: 64). Bigger = faster: MPS 8->488/s, 64->2004/s. "
+        help="Embedding encode batch size (default: 64). On an M1 Max, MPS 8->488/s and 64->2004/s. "
              "Lower (e.g. 8) on low-RAM CPU-only hosts: batch 4096 on CPU uses ~4GB RAM."
     )
     

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare legacy scalar cosine retrieval with the vec0 MATCH index."""
+"""Compare scalar cosine and vec0 MATCH on the M1 Max benchmark host."""
 
 import argparse
 import json
@@ -74,6 +74,7 @@ def main() -> None:
 
     output = {
         "environment": {
+            "benchmark_host": "Apple M1 Max",
             "sqlite": conn.execute("SELECT sqlite_version()").fetchone()[0],
             "sqlite_vec": conn.execute("SELECT vec_version()").fetchone()[0],
             "vectors": conn.execute("SELECT COUNT(*) FROM email_vectors_v2").fetchone()[0],
