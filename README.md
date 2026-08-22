@@ -57,6 +57,18 @@ A powerful indexing and search engine for Maildir email archives. Combines tradi
 
 ---
 
+## Design Decisions and Performance Studies
+
+These notes explain why the search architecture uses hybrid RRF, exact `vec0 MATCH` retrieval, and different compute devices for interactive queries and bulk ingestion. All published performance measurements were collected on an Apple M1 Max.
+
+| Study | What it explains |
+|---|---|
+| [Hybrid Search with Reciprocal Rank Fusion](https://github.com/thomasmaerz/emailindex/wiki/Hybrid-Search-with-Reciprocal-Rank-Fusion) | Why FTS5 and semantic retrieval complement each other, and why rank fusion is safer than combining incompatible BM25 and cosine scores. |
+| [Exact Vector Search Performance Study](https://github.com/thomasmaerz/emailindex/wiki/Exact-Vector-Search-Performance-Study) | Why stable sqlite-vec exact KNN was chosen instead of experimental ANN, including correctness tradeoffs, filter fallbacks, and measured scalar-to-`MATCH` speedups. |
+| [CPU vs MPS Query Performance Study](https://github.com/thomasmaerz/emailindex/wiki/CPU-vs-MPS-Query-Performance-Study) | Why MCP query embeddings default to CPU while bulk ingestion retains MPS/CUDA acceleration, with latency, CPU-load, and break-even benchmarks. |
+
+---
+
 ## Architecture
 
 ```mermaid
