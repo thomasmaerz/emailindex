@@ -36,7 +36,9 @@ from ingest import (
 
 def _fake_encode_text_to_embedding(text: str) -> bytes:
     tokens = re.findall(r"[a-z0-9]+", text.lower())[:20]
-    vector = np.zeros(16, dtype=np.float32)
+    # Must match production dimensions (384-dim bge-small-en-v1.5):
+    # insert_email -> replace_vector rejects any other size.
+    vector = np.zeros(384, dtype=np.float32)
     for token in tokens:
         vector[hash(token) % len(vector)] += 1.0
     norm = np.linalg.norm(vector)
