@@ -1,0 +1,66 @@
+name: embeddings-full
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # nightly 03:00 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "ingest.py"
+      - "embedding_device.py"
+      - "mcp_server/database.py"
+      - "mcp_server/vector_index.py"
+      - "mcp_server/config.py"
+      - "migrate*.py"
+      - "requirements.txt"
+      - ".github/workflows/embeddings-full.yml"
+      - "tests/conftest.py"
+      - "tests/test_embedding_regression.py"
+  push:
+    branches: [main]
+    paths:
+      - "ingest.py"
+      - "embedding_device.py"
+      - "mcp_server/database.py"
+      - "mcp_server/vector_index.py"
+      - "mcp_server/config.py"
+      - "migrate*.py"
+      - "requirements.txt"
+      - ".github/workflows/embeddings-full.yml"
+      - "tests/conftest.py"
+      - "tests/test_embedding_regression.py"
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HF_HUB_OFFLINE: "0"
+      EMAILINDEX_FULL_FIXTURE: "1"
+      EMAILINDEX_FULL_COUNT: "2000"
+      EMAILINDEX_EMBED_BATCH: "32"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies (+ datasets for Enron slice)
+        run: |
+          pip install -r requirements.txt
+          pip install "datasets>=2.14.0"
+
+      - name: Cache HuggingFace model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-bge-small-en-v1-5-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            hf-bge-small-en-v1-5-
+
+      - name: Full Enron fixture + whole suite
+        run: |
+          python -m pytest tests/ -q -rs

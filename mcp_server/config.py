@@ -1,9 +1,12 @@
 from pathlib import Path
+import os
 
 
 class Config:
     BASE_DIR = Path(__file__).parent.parent
-    DB_PATH = BASE_DIR / "db" / "emails.db"
+    # Env override lets CI point the server at a fixture DB without touching
+    # the operator's live db/emails.db.
+    DB_PATH = Path(os.environ.get("EMAILINDEX_DB_PATH", str(BASE_DIR / "db" / "emails.db")))
     ATTACHMENTS_DIR = BASE_DIR / "attachments"
     
     EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
