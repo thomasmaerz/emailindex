@@ -13,6 +13,7 @@ Tiered strategy (issue #40):
 """
 
 import os
+import json
 import sqlite3
 import struct
 import sys
@@ -192,7 +193,7 @@ def enron_db(tmp_path_factory):
     except ImportError:
         pytest.skip("datasets package not installed")
     try:
-        ds = load_dataset("enronarchive/mail", split="train", streaming=True)
+        ds = load_dataset("corbt/enron-emails", split="train", streaming=True)
         rows = []
         for row in ds.take(int(os.environ.get("EMAILINDEX_FULL_COUNT", "2000"))):
             rows.append(row)
@@ -213,24 +214,44 @@ def enron_db(tmp_path_factory):
     try:
         texts, records = [], []
         for i, row in enumerate(rows):
+            # corbt/enron-emails schema: message_id, subject, from, to, cc,
+            # bcc, date (timestamp), body, file_name. Fallbacks keep this
+            # robust to schema drift.
             subject = str(row.get("subject") or "(no subject)")[:200]
             body = str(row.get("body") or row.get("text") or "")[:1500]
             sender = str(row.get("from") or row.get("sender") or "unknown@enron.com")
-            eid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"enron-{i}-{sender}"))
+            raw_to = row.get("to") or []
+            try:
+                to_list = [str(a) for a in list(raw_to) if a]
+            except TypeError:
+                to_list = [str(raw_to)] if raw_to else []
+            raw_date = row.get("date")
+            try:
+                timestamp = raw_date.isoformat() if hasattr(raw_date, "isoformat") else str(raw_date)
+            except Exception:
+                timestamp = "2001-06-15T10:00:00Z"
+            message_id = str(row.get("message_id") or f"enron-{i}@ci.emailindex.local")
+            if "@" not in message_id:
+                message_id = f"<{message_id}@ci.emailindex.local>"
+            elif not message_id.startswith("<"):
+                message_id = f"<{message_id}>"
+            eid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"enron-{i}-{message_id}"))
             rec = _record(
                 id=eid,
-                message_id=f"<enron-{i}@ci.emailindex.local>",
+                message_id=message_id,
                 thread_id=f"thread-enron-{i // 10:04d}",
                 subject_thread_key=subject.lower()[:100],
-                timestamp="2001-06-15T10:00:00Z",
+                timestamp=timestamp,
                 from_address=sender,
                 from_name=None,
+                to_addresses=json.dumps(to_list or [sender]),
                 subject=subject,
                 body_markdown=body,
                 body_plain=body,
                 body_text=body,
                 body_main_text=body,
                 sender=sender,
+                recipients=json.dumps(to_list or [sender]),
                 embedding=_pseudo_embedding(0),  # replaced below
             )
             texts.append(ingest.generate_embedding_text(rec))
