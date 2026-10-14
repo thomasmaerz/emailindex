@@ -63,4 +63,4 @@ jobs:
 
       - name: Full Enron fixture + whole suite
         run: |
-          python -m pytest tests/ -q
+          python -m pytest tests/ -q -rs
