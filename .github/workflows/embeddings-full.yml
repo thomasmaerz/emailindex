@@ -4,6 +4,18 @@ on:
   schedule:
     - cron: "0 3 * * *" # nightly 03:00 UTC
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "ingest.py"
+      - "embedding_device.py"
+      - "mcp_server/database.py"
+      - "mcp_server/vector_index.py"
+      - "mcp_server/config.py"
+      - "migrate*.py"
+      - "requirements.txt"
+      - ".github/workflows/embeddings-full.yml"
+      - "tests/conftest.py"
+      - "tests/test_embedding_regression.py"
   push:
     branches: [main]
     paths:
