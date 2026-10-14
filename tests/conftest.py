@@ -210,7 +210,7 @@ def enron_db(tmp_path_factory):
         )
     except Exception as exc:
         pytest.skip(f"embedding model unavailable: {exc}")
-    conn = sqlite3.connect(str(db_path))
+    conn = ingest.get_db_connection(db_path)
     try:
         texts, records = [], []
         for i, row in enumerate(rows):
