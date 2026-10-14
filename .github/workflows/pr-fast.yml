@@ -1,0 +1,32 @@
+name: pr-fast
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HF_HUB_OFFLINE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fast tests (small deterministic fixture + MCP stdio e2e)
+        run: |
+          python -m pytest tests/test_embedding_regression.py tests/test_embedding_offline.py tests/test_mcp_stdio.py tests/test_vec0_match.py -q
+
+      - name: Full unit suite (no network)
+        run: |
+          python -m pytest tests/ -q -m "not requires_db" --ignore=tests/test_mcp_stdio.py --ignore=tests/test_embedding_regression.py -p no:cacheprovider
